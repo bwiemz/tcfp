@@ -20,9 +20,12 @@ import torch.nn.functional as F
 
 from tcfp.core import (
     DEFAULT_BLOCK_SIZE,
+    FP8_E4M3_MAX,
+    FP8_E4M3_MIN,
     ErrorFeedbackState,
     TCFPMode,
     ensure_column_major,
+    stochastic_round_to_fp8_e4m3,
     to_fp8_e4m3,
     to_fp8_e4m3_nf_aware,
     to_fp8_e5m2,
@@ -365,6 +368,68 @@ class _FP8TensorCoreFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 
+def _delayed_quantise_w_hi(
+    w: torch.Tensor,
+    state: ErrorFeedbackState,
+    name: str,
+    nf_aware: bool,
+    sigma_factor: float,
+    stochastic: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantise main weight component with delayed (EMA) scaling.
+
+    Returns ``(w_hi_fp8, w_hi_inv, current_amax_hi)`` where
+    *current_amax_hi* is the effective amax used for residual prediction.
+    """
+    if nf_aware:
+        t = w.float()
+        std = t.std().clamp(min=1e-12)
+        target_max = (
+            t.abs().max().clamp(min=1e-12)
+            if std < 1e-6
+            else sigma_factor * std
+        )
+        delayed = state.get_delayed_amax(name + ".w_hi", target_max)
+        scale = (FP8_E4M3_MAX / delayed).to(torch.float32)
+        scaled = (t * scale).clamp(FP8_E4M3_MIN, FP8_E4M3_MAX)
+        fp8 = (
+            stochastic_round_to_fp8_e4m3(scaled)
+            if stochastic
+            else scaled.to(torch.float8_e4m3fn)
+        )
+        inv = torch.ones(1, device=w.device, dtype=torch.float32) / scale
+        return fp8, inv, delayed
+    else:
+        current = w.abs().max().clamp(min=1e-12)
+        delayed = state.get_delayed_amax(name + ".w_hi", current)
+        scale = (FP8_E4M3_MAX / delayed).to(torch.float32)
+        fp8, inv = to_fp8_e4m3(w, scale=scale)
+        return fp8, inv, delayed
+
+
+def _delayed_quantise_w_lo(
+    residual: torch.Tensor,
+    state: ErrorFeedbackState,
+    name: str,
+    main_amax: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantise residual weight with predictive scaling.
+
+    On validation steps (first call + every 100), computes the actual
+    residual amax and recalibrates the prediction ratio.  On other steps,
+    the residual amax is predicted from the main component's amax —
+    eliminating one full amax reduction.
+    """
+    if state.should_validate_residual(name):
+        actual = residual.abs().max().clamp(min=1e-12)
+        state.update_residual_ratio(name, main_amax, actual)
+        scale = (FP8_E4M3_MAX / actual).to(torch.float32)
+    else:
+        predicted = state.predict_residual_amax(name, main_amax)
+        scale = (FP8_E4M3_MAX / predicted).to(torch.float32)
+    return to_fp8_e4m3(residual, scale=scale)
+
+
 class _TCFP12TensorCoreFunction(torch.autograd.Function):
     """
     TCFP-12 on tensor cores via 2-GEMM residual FP8 decomposition.
@@ -389,6 +454,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         hp_grad_weight: bool,
         error_state: ErrorFeedbackState | None,
         param_name: str,
+        delayed_scaling: bool = False,
     ) -> torch.Tensor:
         # --- 1. Error feedback on weight ---
         w = weight.float()
@@ -397,7 +463,13 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             w = w + error_buf
 
         # --- 2. Quantise W_hi (main component) ---
-        if nf_aware_scaling:
+        current_amax_hi: torch.Tensor | None = None
+        if delayed_scaling and error_state is not None:
+            w_hi_fp8, w_hi_inv, current_amax_hi = _delayed_quantise_w_hi(
+                w, error_state, param_name, nf_aware_scaling,
+                sigma_factor, stochastic_rounding,
+            )
+        elif nf_aware_scaling:
             w_hi_fp8, w_hi_inv = to_fp8_e4m3_nf_aware(
                 w, sigma_factor, stochastic_rounding
             )
@@ -406,7 +478,12 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
 
         # --- 3. Compute residual and quantise W_lo ---
         residual = w - w_hi_fp8.float() * w_hi_inv
-        w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
+        if current_amax_hi is not None and error_state is not None:
+            w_lo_fp8, w_lo_inv = _delayed_quantise_w_lo(
+                residual, error_state, param_name, current_amax_hi,
+            )
+        else:
+            w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
 
         # --- 4. Error feedback: store total quantisation error ---
         if error_state is not None:
@@ -421,7 +498,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         input_2d = (
             input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
         )
-        act_fp8, act_inv = to_fp8_e4m3(input_2d)
+        act_fp8, act_inv = to_fp8_e4m3(input_2d)  # always fresh
 
         # --- 6. Two FP8 GEMMs: output = (act @ W_hi.T) + (act @ W_lo.T) ---
         output_hi = torch._scaled_mm(
@@ -452,6 +529,9 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         ctx.hp_grad_weight = hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
         ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
         ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.delayed_scaling = delayed_scaling  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.error_state = error_state  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.param_name = param_name  # pyright: ignore[reportAttributeAccessIssue]
         saved = [
             input_2d if hp_grad_weight else act_fp8,
             w_hi_fp8,
@@ -474,7 +554,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
-        None, None, None, None, None, None,
+        None, None, None, None, None, None, None,
     ]:
         saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
         saved_act = saved[0]
@@ -482,7 +562,6 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
         hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
         input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
-
         # --- 1. Flatten grad to 2D ---
         grad_2d = (
             grad_output.reshape(-1, grad_output.shape[-1])
@@ -490,7 +569,9 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             else grad_output
         )
 
-        # --- 2. Quantise grad to FP8 E5M2 ---
+        # --- 2. Quantise grad to FP8 E5M2 (always fresh) ---
+        # Gradients change too rapidly during training for EMA-delayed
+        # scaling — precision loss from stale scales degrades convergence.
         grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
 
         # --- 3. dX = grad @ W_hi + grad @ W_lo (2 GEMMs) ---
@@ -537,7 +618,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             grad_input,
             grad_weight,
             grad_bias,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         )
 
 
@@ -568,6 +649,8 @@ class TCFPLinear(nn.Module):
         use_tensor_cores: Use real FP8 tensor core GEMMs.
         hp_grad_weight: Compute weight gradient in FP32 instead of FP8.
         error_feedback: Enable error feedback for tensor core path.
+        delayed_scaling: Use predictive dual-track delayed scaling
+            (TCFP-12 tensor core path only).
     """
 
     def __init__(
@@ -586,12 +669,25 @@ class TCFPLinear(nn.Module):
         use_tensor_cores: bool = False,
         hp_grad_weight: bool = False,
         error_feedback: bool = True,
+        delayed_scaling: bool = False,
     ) -> None:
         super().__init__()
         if nf4_residual and use_tensor_cores and mode == TCFPMode.TCFP12:
             warnings.warn(
                 "nf4_residual is ignored in tensor core mode — NF4 cannot "
                 "run on tensor cores. The residual uses FP8 E4M3 instead.",
+                stacklevel=2,
+            )
+        if delayed_scaling and not use_tensor_cores:
+            warnings.warn(
+                "delayed_scaling requires use_tensor_cores=True and is "
+                "ignored without it.",
+                stacklevel=2,
+            )
+        if delayed_scaling and mode != TCFPMode.TCFP12:
+            warnings.warn(
+                "delayed_scaling is only supported for TCFP12 tensor core "
+                "mode and is ignored for other modes.",
                 stacklevel=2,
             )
         self.in_features = in_features
@@ -606,6 +702,7 @@ class TCFPLinear(nn.Module):
         self._warmup_remaining = warmup_steps
         self.use_tensor_cores = use_tensor_cores
         self.hp_grad_weight = hp_grad_weight
+        self.delayed_scaling = delayed_scaling
 
         # Error feedback state for tensor core path
         self._error_state: ErrorFeedbackState | None = None
@@ -636,22 +733,31 @@ class TCFPLinear(nn.Module):
 
         # Tensor core path: real FP8 GEMMs via torch._scaled_mm
         if self.use_tensor_cores:
-            tc_fn = (
-                _TCFP12TensorCoreFunction
-                if self.mode == TCFPMode.TCFP12
-                else _FP8TensorCoreFunction
-            )
-            result: torch.Tensor = tc_fn.apply(  # pyright: ignore[reportAssignmentType]
-                x,
-                self.weight,
-                self.bias,
-                self.nf_aware_scaling,
-                self.sigma_factor,
-                self.stochastic_rounding,
-                self.hp_grad_weight,
-                self._error_state,
-                self._param_name,
-            )
+            if self.mode == TCFPMode.TCFP12:
+                result: torch.Tensor = _TCFP12TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
+                    x,
+                    self.weight,
+                    self.bias,
+                    self.nf_aware_scaling,
+                    self.sigma_factor,
+                    self.stochastic_rounding,
+                    self.hp_grad_weight,
+                    self._error_state,
+                    self._param_name,
+                    self.delayed_scaling,
+                )
+            else:
+                result = _FP8TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
+                    x,
+                    self.weight,
+                    self.bias,
+                    self.nf_aware_scaling,
+                    self.sigma_factor,
+                    self.stochastic_rounding,
+                    self.hp_grad_weight,
+                    self._error_state,
+                    self._param_name,
+                )
             return result
 
         # Fake-quantise path: STE + F.linear
@@ -686,6 +792,8 @@ class TCFPLinear(nn.Module):
             parts.append("nf_aware_scaling=True")
         if self.stochastic_rounding:
             parts.append("stochastic_rounding=True")
+        if self.delayed_scaling:
+            parts.append("delayed_scaling=True")
         if self._warmup_steps > 0:
             parts.append(f"warmup_steps={self._warmup_steps}")
         return ", ".join(parts)
@@ -814,6 +922,7 @@ def convert_to_tcfp(
     use_tensor_cores: bool = False,
     hp_grad_weight: bool = False,
     error_feedback: bool = True,
+    delayed_scaling: bool = False,
     _parent_path: str = "",
 ) -> nn.Module:
     """
@@ -836,6 +945,8 @@ def convert_to_tcfp(
         use_tensor_cores: Use real FP8 tensor core GEMMs (TCFPLinear only).
         hp_grad_weight: Compute weight gradient in FP32 (tensor core path).
         error_feedback: Enable error feedback (tensor core path).
+        delayed_scaling: Use predictive dual-track delayed scaling
+            (TCFP-12 tensor core path only).
 
     Returns:
         The converted model (modified in-place).
@@ -856,6 +967,7 @@ def convert_to_tcfp(
             use_tensor_cores=use_tensor_cores,
             hp_grad_weight=hp_grad_weight,
             error_feedback=error_feedback,
+            delayed_scaling=delayed_scaling,
             _parent_path=full_path,
         )
 
@@ -884,6 +996,7 @@ def convert_to_tcfp(
                 use_tensor_cores=layer_tc,
                 hp_grad_weight=hp_grad_weight,
                 error_feedback=error_feedback,
+                delayed_scaling=delayed_scaling and layer_tc,
             )
             new_module._param_name = full_path
             new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]

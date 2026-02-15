@@ -448,6 +448,9 @@ def main() -> None:
         }),
         ("TCFP-12", TCFPMode.TCFP12, {}),
         ("TCFP-12-TC", TCFPMode.TCFP12, {"use_tensor_cores": True}),
+        ("TCFP-12-TC-DS", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "delayed_scaling": True,
+        }),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
         ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
@@ -530,6 +533,7 @@ def main() -> None:
     bf16_results = [r for r in mnist_results + gpt_results if r["mode"] == "BF16 baseline"]
     tcfp12_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12"]
     tcfp12e_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12-Enh"]
+    tcfp12ds_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12-TC-DS"]
 
     print(f"\n  All modes converged: {'YES' if all_converged else 'NO'}")
 
@@ -554,6 +558,18 @@ def main() -> None:
             f"({'BF16 better' if acc_gap_e > 0 else 'TCFP-12-Enh better'})"
         )
         print(f"    ms/step ratio: {tcfp12e_mnist['ms_per_step'] / bf16_mnist['ms_per_step']:.2f}x")
+
+    if bf16_results and tcfp12ds_results:
+        bf16_mnist = bf16_results[0]
+        tcfp12ds_mnist = tcfp12ds_results[0]
+        acc_gap_ds = bf16_mnist["accuracy"] - tcfp12ds_mnist["accuracy"]
+        print("\n  TCFP-12-TC-DS vs BF16 (MNIST):")
+        print(
+            f"    Accuracy gap: {acc_gap_ds:+.1%} "
+            f"({'BF16 better' if acc_gap_ds > 0 else 'TCFP-12-TC-DS better'})"
+        )
+        ds_ratio = tcfp12ds_mnist["ms_per_step"] / bf16_mnist["ms_per_step"]
+        print(f"    ms/step ratio: {ds_ratio:.2f}x")
 
     # GPT comparison
     if len(bf16_results) > 1 and len(tcfp12_results) > 1:
@@ -585,6 +601,24 @@ def main() -> None:
         e_ms = tcfp12e_gpt["ms_per_step"]
         print(f"    BF16:        loss={bf_l:.4f}, ms/step={bf_ms:.1f}")
         print(f"    TCFP-12-Enh: loss={e_l:.4f}, ms/step={e_ms:.1f}")
+
+    if len(bf16_results) > 1 and len(tcfp12ds_results) > 1:
+        bf16_gpt = bf16_results[1]
+        tcfp12ds_gpt = tcfp12ds_results[1]
+        ppl_ratio_ds = tcfp12ds_gpt["perplexity"] / bf16_gpt["perplexity"]
+        print("\n  TCFP-12-TC-DS vs BF16 (TinyGPT):")
+        qual_ds = (
+            "similar"
+            if 0.9 < ppl_ratio_ds < 1.1
+            else ("degraded" if ppl_ratio_ds > 1 else "better")
+        )
+        print(f"    Perplexity ratio: {ppl_ratio_ds:.3f}x ({qual_ds})")
+        bf_l = bf16_gpt["final_loss"]
+        bf_ms = bf16_gpt["ms_per_step"]
+        ds_l = tcfp12ds_gpt["final_loss"]
+        ds_ms = tcfp12ds_gpt["ms_per_step"]
+        print(f"    BF16:          loss={bf_l:.4f}, ms/step={bf_ms:.1f}")
+        print(f"    TCFP-12-TC-DS: loss={ds_l:.4f}, ms/step={ds_ms:.1f}")
 
     print("\n" + "=" * 72)
 

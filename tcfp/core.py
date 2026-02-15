@@ -277,10 +277,19 @@ class ErrorFeedbackState:
     to the next quantisation input, ensuring unbiased long-term rounding.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        ema_decay: float = 0.999,
+        residual_validation_interval: int = 100,
+    ) -> None:
         self._buffers: dict[str, torch.Tensor] = {}
         self._amax_ema: dict[str, torch.Tensor] = {}
-        self._ema_decay: float = 0.999
+        self._ema_decay: float = ema_decay
+        # Delayed scaling state (Predictive Dual-Track)
+        self._delayed_amax: dict[str, torch.Tensor] = {}
+        self._residual_ratio: dict[str, torch.Tensor] = {}
+        self._step_count: dict[str, int] = {}
+        self._residual_validation_interval: int = residual_validation_interval
 
     def get_error(self, name: str, like: torch.Tensor) -> torch.Tensor:
         if name not in self._buffers or self._buffers[name].shape != like.shape:
@@ -301,9 +310,78 @@ class ErrorFeedbackState:
             )
         return self._amax_ema[name]
 
+    # -- Delayed scaling (Predictive Dual-Track) -------------------------
+
+    def get_delayed_amax(
+        self, name: str, current_amax: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return EMA-smoothed amax for delayed scaling.
+
+        On first call for a given *name*, returns *current_amax* unchanged
+        (no delay on step 0).  Subsequent calls return the EMA blend of the
+        previous delayed value and the new *current_amax*.
+        """
+        if name not in self._delayed_amax:
+            self._delayed_amax[name] = current_amax.detach().clone()
+            return current_amax
+        prev = self._delayed_amax[name]
+        self._delayed_amax[name] = (
+            self._ema_decay * prev
+            + (1 - self._ema_decay) * current_amax.detach()
+        )
+        return self._delayed_amax[name]
+
+    def predict_residual_amax(
+        self, name: str, main_amax: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the residual (W_lo) amax from the main (W_hi) amax.
+
+        Uses a tracked EMA of the ``amax_lo / amax_hi`` ratio.  If the
+        ratio has not been tracked yet, falls back to the theoretical
+        bound for FP8 E4M3 (3 mantissa bits → max relative error ≈ 1/8).
+        """
+        ratio_key = f"{name}.ratio"
+        if ratio_key not in self._residual_ratio:
+            return (main_amax / 8.0).clamp(min=1e-12)
+        return (main_amax * self._residual_ratio[ratio_key]).clamp(min=1e-12)
+
+    def update_residual_ratio(
+        self,
+        name: str,
+        main_amax: torch.Tensor,
+        actual_residual_amax: torch.Tensor,
+    ) -> None:
+        """Update the EMA of ``amax_lo / amax_hi``."""
+        ratio = (
+            actual_residual_amax / main_amax.clamp(min=1e-12)
+        ).detach()
+        ratio_key = f"{name}.ratio"
+        if ratio_key not in self._residual_ratio:
+            self._residual_ratio[ratio_key] = ratio
+        else:
+            self._residual_ratio[ratio_key] = (
+                self._ema_decay * self._residual_ratio[ratio_key]
+                + (1 - self._ema_decay) * ratio
+            )
+
+    def should_validate_residual(self, name: str) -> bool:
+        """Return ``True`` on the first call and every *interval* steps.
+
+        Used to periodically compute the actual residual amax and
+        recalibrate the predictive ratio.  The interval is set via
+        ``residual_validation_interval`` in the constructor.
+        """
+        key = f"{name}.steps"
+        count = self._step_count.get(key, 0) + 1
+        self._step_count[key] = count
+        return count == 1 or count % self._residual_validation_interval == 0
+
     def reset(self) -> None:
         self._buffers.clear()
         self._amax_ema.clear()
+        self._delayed_amax.clear()
+        self._residual_ratio.clear()
+        self._step_count.clear()
 
 
 # ---------------------------------------------------------------------------
