@@ -30,9 +30,24 @@ from tcfp.core import (
     to_fp8_e4m3_nf_aware,
     to_fp8_e5m2,
 )
-from tcfp.tcfp8 import fake_quantize_tcfp8
 from tcfp.tcfp12 import fake_quantize_tcfp12
 from tcfp.tcfp16 import fake_quantize_tcfp16
+
+# Fused Triton kernels (optional — graceful fallback to torch._scaled_mm)
+try:
+    from tcfp.kernels import (
+        block_dequantize_fp8,
+        block_quantize_fp8,
+        fused_block_scaled_dual_gemm_backward_dx,
+        fused_block_scaled_dual_gemm_forward,
+        fused_dual_gemm_backward_dx,
+        fused_dual_gemm_forward,
+        is_triton_available,
+    )
+
+    _HAS_FUSED_KERNELS = is_triton_available()
+except ImportError:
+    _HAS_FUSED_KERNELS = False
 
 # ---------------------------------------------------------------------------
 # Autograd: STE Fake-Quantize
@@ -53,9 +68,7 @@ class _STEFakeQuantize(torch.autograd.Function):
         sigma_factor: float,
         stochastic_rounding: bool,
     ) -> torch.Tensor:
-        if mode == TCFPMode.TCFP8:
-            return fake_quantize_tcfp8(x, block_size=block_size)
-        elif mode == TCFPMode.TCFP12:
+        if mode == TCFPMode.TCFP12:
             return fake_quantize_tcfp12(
                 x,
                 block_size=block_size,
@@ -80,7 +93,7 @@ class _STEFakeQuantize(torch.autograd.Function):
 
 def ste_fake_quantize(
     x: torch.Tensor,
-    mode: TCFPMode = TCFPMode.TCFP8,
+    mode: TCFPMode = TCFPMode.TCFP12,
     block_size: int = DEFAULT_BLOCK_SIZE,
     *,
     nf4_residual: bool = False,
@@ -215,154 +228,6 @@ class _FP8LinearFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 
-class _FP8TensorCoreFunction(torch.autograd.Function):
-    """
-    Linear layer using real FP8 tensor core GEMMs via ``torch._scaled_mm``.
-
-    Forward: quantise both activation + weight to FP8, run FP8 GEMM.
-    Backward: quantise grad to FP8 E5M2, two more FP8 GEMMs for dX and dW.
-    """
-
-    @staticmethod
-    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
-        ctx: torch.autograd.function.FunctionCtx,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-        nf_aware_scaling: bool,
-        sigma_factor: float,
-        stochastic_rounding: bool,
-        hp_grad_weight: bool,
-        error_state: ErrorFeedbackState | None,
-        param_name: str,
-    ) -> torch.Tensor:
-        # --- 1. Error feedback on weight ---
-        w = weight.float()
-        if error_state is not None:
-            error_buf = error_state.get_error(param_name, w)
-            w = w + error_buf
-
-        # --- 2. Quantise weight to FP8 E4M3 ---
-        if nf_aware_scaling:
-            w_fp8, w_inv = to_fp8_e4m3_nf_aware(w, sigma_factor, stochastic_rounding)
-        else:
-            w_fp8, w_inv = to_fp8_e4m3(w)
-
-        # --- 3. Error feedback: store quantisation error ---
-        if error_state is not None:
-            w_dequant = w_fp8.float() * w_inv
-            quant_error = weight.float() - w_dequant
-            error_state.update_error(param_name, quant_error)
-
-        # --- 4. Flatten input to 2D ---
-        input_shape = input.shape
-        input_2d = input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
-
-        # --- 5. Quantise activation to FP8 E4M3 ---
-        act_fp8, act_inv = to_fp8_e4m3(input_2d)
-
-        # --- 6. FP8 GEMM: output = act @ weight.T ---
-        # w_fp8 is (D_out, D_in) row-major; w_fp8.t() is (D_in, D_out) col-major
-        output_2d = torch._scaled_mm(
-            act_fp8,
-            w_fp8.t(),
-            scale_a=act_inv,
-            scale_b=w_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-
-        # --- 7. Add bias and reshape ---
-        if bias is not None:
-            output_2d = output_2d + bias
-
-        output = output_2d.reshape(*input_shape[:-1], output_2d.shape[-1])
-
-        # --- 8. Save for backward ---
-        ctx.hp_grad_weight = hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
-        ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
-        ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
-        saved = [input_2d if hp_grad_weight else act_fp8, w_fp8, w_inv, act_inv]
-        if bias is not None:
-            saved.append(bias)
-        ctx.save_for_backward(*saved)
-
-        return output
-
-    @staticmethod
-    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
-        ctx: torch.autograd.function.FunctionCtx,
-        grad_output: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        None, None, None, None, None, None,
-    ]:
-        saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
-        saved_act, w_fp8, w_inv, act_inv = saved[:4]
-        has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
-        hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
-        input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
-
-        # --- 1. Flatten grad to 2D ---
-        grad_2d = (
-            grad_output.reshape(-1, grad_output.shape[-1])
-            if grad_output.ndim == 3
-            else grad_output
-        )
-
-        # --- 2. Quantise grad to FP8 E5M2 (wider range for gradients) ---
-        grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
-
-        # --- 3. dX = grad_output @ weight ---
-        # grad_fp8: (M, D_out) row-major, w_fp8: (D_out, D_in) needs col-major
-        grad_input_2d = torch._scaled_mm(
-            grad_fp8,
-            ensure_column_major(w_fp8),
-            scale_a=grad_inv,
-            scale_b=w_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-
-        # Reshape to match input
-        grad_input = grad_input_2d.reshape(input_shape)
-
-        # --- 4. dW = grad.T @ activation ---
-        M = grad_2d.shape[0]
-        if hp_grad_weight:
-            # High-precision: FP32 matmul
-            grad_weight = grad_2d.t() @ saved_act
-        elif M % 16 != 0:
-            # _scaled_mm requires inner dim (M) divisible by 16.
-            # Fall back to FP32 for small/unaligned batch sizes.
-            grad_weight = grad_2d.t() @ (saved_act.float() * act_inv)
-        else:
-            # FP8 GEMM for dW
-            # grad.T: (D_out, M) — need contiguous row-major
-            grad_t_fp8 = grad_fp8.t().contiguous()
-            # act_fp8: (M, D_in) — need col-major
-            grad_weight = torch._scaled_mm(
-                grad_t_fp8,
-                ensure_column_major(saved_act),
-                scale_a=grad_inv,
-                scale_b=act_inv,
-                out_dtype=torch.float32,
-                use_fast_accum=False,
-            )
-
-        # --- 5. dBias ---
-        grad_bias = grad_2d.sum(dim=0) if has_bias else None
-
-        return (
-            grad_input,
-            grad_weight,
-            grad_bias,
-            None, None, None, None, None, None,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Autograd: TCFP-12 Tensor Core GEMM (2-GEMM residual decomposition)
 # ---------------------------------------------------------------------------
@@ -455,6 +320,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         error_state: ErrorFeedbackState | None,
         param_name: str,
         delayed_scaling: bool = False,
+        use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         # --- 1. Error feedback on weight ---
         w = weight.float()
@@ -501,23 +367,29 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         act_fp8, act_inv = to_fp8_e4m3(input_2d)  # always fresh
 
         # --- 6. Two FP8 GEMMs: output = (act @ W_hi.T) + (act @ W_lo.T) ---
-        output_hi = torch._scaled_mm(
-            act_fp8,
-            w_hi_fp8.t(),
-            scale_a=act_inv,
-            scale_b=w_hi_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-        output_lo = torch._scaled_mm(
-            act_fp8,
-            w_lo_fp8.t(),
-            scale_a=act_inv,
-            scale_b=w_lo_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-        output_2d = output_hi + output_lo
+        if _HAS_FUSED_KERNELS and use_fused_kernel:
+            output_2d = fused_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                act_fp8, w_hi_fp8, w_lo_fp8,
+                act_inv, w_hi_inv, w_lo_inv,
+            )
+        else:
+            output_hi = torch._scaled_mm(
+                act_fp8,
+                w_hi_fp8.t(),
+                scale_a=act_inv,
+                scale_b=w_hi_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+            output_lo = torch._scaled_mm(
+                act_fp8,
+                w_lo_fp8.t(),
+                scale_a=act_inv,
+                scale_b=w_lo_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+            output_2d = output_hi + output_lo
 
         # --- 7. Add bias and reshape ---
         if bias is not None:
@@ -532,6 +404,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         ctx.delayed_scaling = delayed_scaling  # pyright: ignore[reportAttributeAccessIssue]
         ctx.error_state = error_state  # pyright: ignore[reportAttributeAccessIssue]
         ctx.param_name = param_name  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.use_fused_kernel = use_fused_kernel  # pyright: ignore[reportAttributeAccessIssue]
         saved = [
             input_2d if hp_grad_weight else act_fp8,
             w_hi_fp8,
@@ -554,7 +427,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
-        None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
     ]:
         saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
         saved_act = saved[0]
@@ -562,6 +435,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
         hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
         input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
+        use_fused: bool = ctx.use_fused_kernel  # pyright: ignore[reportAttributeAccessIssue]
         # --- 1. Flatten grad to 2D ---
         grad_2d = (
             grad_output.reshape(-1, grad_output.shape[-1])
@@ -575,23 +449,31 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
 
         # --- 3. dX = grad @ W_hi + grad @ W_lo (2 GEMMs) ---
-        grad_input_hi = torch._scaled_mm(
-            grad_fp8,
-            ensure_column_major(w_hi_fp8),
-            scale_a=grad_inv,
-            scale_b=w_hi_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-        grad_input_lo = torch._scaled_mm(
-            grad_fp8,
-            ensure_column_major(w_lo_fp8),
-            scale_a=grad_inv,
-            scale_b=w_lo_inv,
-            out_dtype=torch.float32,
-            use_fast_accum=False,
-        )
-        grad_input = (grad_input_hi + grad_input_lo).reshape(input_shape)
+        if _HAS_FUSED_KERNELS and use_fused:
+            grad_input = fused_dual_gemm_backward_dx(  # pyright: ignore[reportPossiblyUnboundVariable]
+                grad_fp8, w_hi_fp8, w_lo_fp8,
+                grad_inv, w_hi_inv, w_lo_inv,
+            ).reshape(input_shape)
+        else:
+            grad_input_hi = torch._scaled_mm(
+                grad_fp8,
+                ensure_column_major(w_hi_fp8),
+                scale_a=grad_inv,
+                scale_b=w_hi_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+            grad_input_lo = torch._scaled_mm(
+                grad_fp8,
+                ensure_column_major(w_lo_fp8),
+                scale_a=grad_inv,
+                scale_b=w_lo_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+            grad_input = (
+                grad_input_hi + grad_input_lo
+            ).reshape(input_shape)
 
         # --- 4. dW = grad.T @ activation (1 GEMM, no residual needed) ---
         M = grad_2d.shape[0]
@@ -618,7 +500,154 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             grad_input,
             grad_weight,
             grad_bias,
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Autograd: TCFP-12 with per-block scaling on tensor cores
+# ---------------------------------------------------------------------------
+
+
+class _TCFP12BlockScaledFunction(torch.autograd.Function):
+    """
+    TCFP-12 on tensor cores with per-block FP8 scaling.
+
+    Uses custom Triton GEMM kernels (block-scaled) instead of
+    ``torch._scaled_mm`` which only supports scalar scales.
+    """
+
+    @staticmethod
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        scale_block_size: int,
+        hp_grad_weight: bool,
+        error_state: ErrorFeedbackState | None,
+        param_name: str,
+    ) -> torch.Tensor:
+        # --- 1. Error feedback on weight ---
+        w = weight.float()
+        if error_state is not None:
+            error_buf = error_state.get_error(param_name, w)
+            w = w + error_buf
+
+        # --- 2. Block-quantise W_hi (main component) ---
+        w_hi_fp8, w_hi_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            w, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
+        )
+
+        # --- 3. Compute residual and block-quantise W_lo ---
+        w_hi_deq = block_dequantize_fp8(w_hi_fp8, w_hi_scales, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
+        residual = w - w_hi_deq
+        w_lo_fp8, w_lo_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            residual, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
+        )
+
+        # --- 4. Error feedback: store total quantisation error ---
+        if error_state is not None:
+            w_lo_deq = block_dequantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+                w_lo_fp8, w_lo_scales, scale_block_size,
+            )
+            w_reconstructed = w_hi_deq + w_lo_deq
+            quant_error = weight.float() - w_reconstructed
+            error_state.update_error(param_name, quant_error)
+
+        # --- 5. Flatten input to 2D, block-quantise activation ---
+        input_shape = input.shape
+        input_2d = (
+            input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
+        )
+        act_fp8, act_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            input_2d, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
+        )
+
+        # --- 6. Fused block-scaled dual GEMM ---
+        output_2d = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, w_hi_fp8, w_lo_fp8,
+            act_scales, w_hi_scales, w_lo_scales,
+            block_size=scale_block_size,
+        )
+
+        # --- 7. Add bias and reshape ---
+        if bias is not None:
+            output_2d = output_2d + bias
+
+        output = output_2d.reshape(*input_shape[:-1], output_2d.shape[-1])
+
+        # --- 8. Save for backward ---
+        ctx.hp_grad_weight = hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.scale_block_size = scale_block_size  # pyright: ignore[reportAttributeAccessIssue]
+        saved = [
+            input_2d if hp_grad_weight else act_fp8,
+            w_hi_fp8, w_lo_fp8,
+            w_hi_scales, w_lo_scales, act_scales,
+        ]
+        if bias is not None:
+            saved.append(bias)
+        ctx.save_for_backward(*saved)
+
+        return output
+
+    @staticmethod
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        None, None, None, None,
+    ]:
+        saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
+        saved_act = saved[0]
+        w_hi_fp8, w_lo_fp8 = saved[1], saved[2]
+        w_hi_scales, w_lo_scales, act_scales = saved[3], saved[4], saved[5]
+        has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
+        hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
+        bs: int = ctx.scale_block_size  # pyright: ignore[reportAttributeAccessIssue]
+
+        # --- 1. Flatten grad to 2D ---
+        grad_2d = (
+            grad_output.reshape(-1, grad_output.shape[-1])
+            if grad_output.ndim == 3
+            else grad_output
+        )
+
+        # --- 2. Block-quantise grad to FP8 E5M2 ---
+        grad_fp8, grad_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            grad_2d, block_size=bs, fp8_dtype=torch.float8_e5m2,
+        )
+
+        # --- 3. dX = grad @ W_hi + grad @ W_lo (dequant + FP32 matmul) ---
+        grad_input = fused_block_scaled_dual_gemm_backward_dx(  # pyright: ignore[reportPossiblyUnboundVariable]
+            grad_fp8, w_hi_fp8, w_lo_fp8,
+            grad_scales, w_hi_scales, w_lo_scales,
+            block_size=bs,
+        ).reshape(input_shape)
+
+        # --- 4. dW = grad.T @ activation (full precision) ---
+        if hp_grad_weight:
+            grad_weight = grad_2d.t() @ saved_act
+        elif saved_act.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            saved_act_f = block_dequantize_fp8(saved_act, act_scales, bs)  # pyright: ignore[reportPossiblyUnboundVariable]
+            grad_weight = grad_2d.t() @ saved_act_f
+        else:
+            grad_weight = grad_2d.t() @ saved_act
+
+        # --- 5. dBias ---
+        grad_bias = grad_2d.sum(dim=0) if has_bias else None
+
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None, None, None, None,
         )
 
 
@@ -651,6 +680,12 @@ class TCFPLinear(nn.Module):
         error_feedback: Enable error feedback for tensor core path.
         delayed_scaling: Use predictive dual-track delayed scaling
             (TCFP-12 tensor core path only).
+        use_fused_kernel: Use fused Triton 2-GEMM kernel when available
+            (TCFP-12 tensor core path only, requires Triton).
+        scale_block_size: Per-block scaling block size (32, 64, or 128).
+            ``None`` (default) uses per-tensor scaling. Requires Triton
+            and ``use_tensor_cores=True``. Mutually exclusive with
+            ``delayed_scaling``.
     """
 
     def __init__(
@@ -658,7 +693,7 @@ class TCFPLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        mode: TCFPMode = TCFPMode.TCFP8,
+        mode: TCFPMode = TCFPMode.TCFP12,
         block_size: int = DEFAULT_BLOCK_SIZE,
         *,
         nf4_residual: bool = False,
@@ -670,6 +705,8 @@ class TCFPLinear(nn.Module):
         hp_grad_weight: bool = False,
         error_feedback: bool = True,
         delayed_scaling: bool = False,
+        use_fused_kernel: bool = True,
+        scale_block_size: int | None = None,
     ) -> None:
         super().__init__()
         if nf4_residual and use_tensor_cores and mode == TCFPMode.TCFP12:
@@ -702,6 +739,53 @@ class TCFPLinear(nn.Module):
         self._warmup_remaining = warmup_steps
         self.use_tensor_cores = use_tensor_cores
         self.hp_grad_weight = hp_grad_weight
+        self.use_fused_kernel = use_fused_kernel and _HAS_FUSED_KERNELS
+        if use_fused_kernel and not _HAS_FUSED_KERNELS:
+            warnings.warn(
+                "use_fused_kernel=True requested but Triton is not available. "
+                "Falling back to two separate _scaled_mm calls.",
+                stacklevel=2,
+            )
+        # Per-block scaling validation
+        if scale_block_size is not None:
+            if scale_block_size not in (32, 64, 128):
+                raise ValueError(
+                    f"scale_block_size must be 32, 64, or 128, "
+                    f"got {scale_block_size}"
+                )
+            if in_features % scale_block_size != 0:
+                raise ValueError(
+                    f"in_features ({in_features}) must be divisible by "
+                    f"scale_block_size ({scale_block_size})"
+                )
+            if out_features % scale_block_size != 0:
+                raise ValueError(
+                    f"out_features ({out_features}) must be divisible by "
+                    f"scale_block_size ({scale_block_size}). Backward pass "
+                    f"block-quantizes gradients along the output dimension."
+                )
+            if not _HAS_FUSED_KERNELS:
+                warnings.warn(
+                    "scale_block_size requires Triton for block-scaled GEMM "
+                    "kernels. Falling back to per-tensor scaling.",
+                    stacklevel=2,
+                )
+                scale_block_size = None
+            if not use_tensor_cores:
+                warnings.warn(
+                    "scale_block_size requires use_tensor_cores=True and is "
+                    "ignored without it.",
+                    stacklevel=2,
+                )
+                scale_block_size = None
+            if delayed_scaling and scale_block_size is not None:
+                warnings.warn(
+                    "Per-block scaling (scale_block_size) and delayed_scaling "
+                    "are mutually exclusive. Ignoring delayed_scaling.",
+                    stacklevel=2,
+                )
+                delayed_scaling = False
+        self.scale_block_size = scale_block_size
         self.delayed_scaling = delayed_scaling
 
         # Error feedback state for tensor core path
@@ -733,8 +817,18 @@ class TCFPLinear(nn.Module):
 
         # Tensor core path: real FP8 GEMMs via torch._scaled_mm
         if self.use_tensor_cores:
-            if self.mode == TCFPMode.TCFP12:
-                result: torch.Tensor = _TCFP12TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
+            if self.mode == TCFPMode.TCFP12 and self.scale_block_size is not None:
+                result: torch.Tensor = _TCFP12BlockScaledFunction.apply(  # pyright: ignore[reportAssignmentType]
+                    x,
+                    self.weight,
+                    self.bias,
+                    self.scale_block_size,
+                    self.hp_grad_weight,
+                    self._error_state,
+                    self._param_name,
+                )
+            else:
+                result = _TCFP12TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
                     x,
                     self.weight,
                     self.bias,
@@ -745,18 +839,7 @@ class TCFPLinear(nn.Module):
                     self._error_state,
                     self._param_name,
                     self.delayed_scaling,
-                )
-            else:
-                result = _FP8TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
-                    x,
-                    self.weight,
-                    self.bias,
-                    self.nf_aware_scaling,
-                    self.sigma_factor,
-                    self.stochastic_rounding,
-                    self.hp_grad_weight,
-                    self._error_state,
-                    self._param_name,
+                    self.use_fused_kernel,
                 )
             return result
 
@@ -794,6 +877,10 @@ class TCFPLinear(nn.Module):
             parts.append("stochastic_rounding=True")
         if self.delayed_scaling:
             parts.append("delayed_scaling=True")
+        if self.use_fused_kernel:
+            parts.append("use_fused_kernel=True")
+        if self.scale_block_size is not None:
+            parts.append(f"scale_block_size={self.scale_block_size}")
         if self._warmup_steps > 0:
             parts.append(f"warmup_steps={self._warmup_steps}")
         return ", ".join(parts)
@@ -816,7 +903,7 @@ class TCFPLayerNorm(nn.Module):
         self,
         normalized_shape: int | tuple[int, ...],
         eps: float = 1e-5,
-        mode: TCFPMode = TCFPMode.TCFP8,
+        mode: TCFPMode = TCFPMode.TCFP12,
         block_size: int = DEFAULT_BLOCK_SIZE,
         *,
         nf4_residual: bool = False,
@@ -868,7 +955,7 @@ class TCFPEmbedding(nn.Module):
         num_embeddings: int,
         embedding_dim: int,
         padding_idx: int | None = None,
-        mode: TCFPMode = TCFPMode.TCFP8,
+        mode: TCFPMode = TCFPMode.TCFP12,
         block_size: int = DEFAULT_BLOCK_SIZE,
         *,
         nf4_residual: bool = False,
@@ -911,7 +998,7 @@ class TCFPEmbedding(nn.Module):
 
 def convert_to_tcfp(
     model: nn.Module,
-    mode: TCFPMode = TCFPMode.TCFP8,
+    mode: TCFPMode = TCFPMode.TCFP12,
     block_size: int = DEFAULT_BLOCK_SIZE,
     skip_patterns: tuple[str, ...] = ("head",),
     *,
@@ -923,6 +1010,8 @@ def convert_to_tcfp(
     hp_grad_weight: bool = False,
     error_feedback: bool = True,
     delayed_scaling: bool = False,
+    use_fused_kernel: bool = True,
+    scale_block_size: int | None = None,
     _parent_path: str = "",
 ) -> nn.Module:
     """
@@ -947,6 +1036,10 @@ def convert_to_tcfp(
         error_feedback: Enable error feedback (tensor core path).
         delayed_scaling: Use predictive dual-track delayed scaling
             (TCFP-12 tensor core path only).
+        use_fused_kernel: Use fused Triton 2-GEMM kernel when available
+            (TCFP-12 tensor core path only, requires Triton).
+        scale_block_size: Per-block scaling block size (32, 64, or 128).
+            ``None`` uses per-tensor scaling. Requires Triton.
 
     Returns:
         The converted model (modified in-place).
@@ -968,6 +1061,8 @@ def convert_to_tcfp(
             hp_grad_weight=hp_grad_weight,
             error_feedback=error_feedback,
             delayed_scaling=delayed_scaling,
+            use_fused_kernel=use_fused_kernel,
+            scale_block_size=scale_block_size,
             _parent_path=full_path,
         )
 
@@ -983,6 +1078,14 @@ def convert_to_tcfp(
                 module.in_features % 16 == 0
                 and module.out_features % 16 == 0
             )
+            # Per-block scaling: skip for layers where in_features or
+            # out_features isn't divisible by the block size
+            layer_sbs = scale_block_size
+            if layer_sbs is not None and (
+                module.in_features % layer_sbs != 0
+                or module.out_features % layer_sbs != 0
+            ):
+                layer_sbs = None
             new_module = TCFPLinear(
                 module.in_features,
                 module.out_features,
@@ -997,6 +1100,8 @@ def convert_to_tcfp(
                 hp_grad_weight=hp_grad_weight,
                 error_feedback=error_feedback,
                 delayed_scaling=delayed_scaling and layer_tc,
+                use_fused_kernel=use_fused_kernel and layer_tc,
+                scale_block_size=layer_sbs if layer_tc else None,
             )
             new_module._param_name = full_path
             new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]

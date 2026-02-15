@@ -65,19 +65,21 @@ class TestQuantizeTCFP16:
         assert recovered.shape == x.shape
 
     def test_monotonic_quality(self) -> None:
-        """TCFP-8 < TCFP-12 < TCFP-16 in quality (lower MSE)."""
-        from tcfp.tcfp8 import dequantize_tcfp8, quantize_tcfp8
+        """FP8 < TCFP-12 < TCFP-16 in quality (lower MSE)."""
+        from tcfp.core import to_fp8_e4m3
         from tcfp.tcfp12 import dequantize_tcfp12, quantize_tcfp12
 
         torch.manual_seed(42)
         x = torch.randn(64, 256, device=DEVICE)
 
-        mse_8 = (x - dequantize_tcfp8(quantize_tcfp8(x))).pow(2).mean()
+        fp8, inv_s = to_fp8_e4m3(x)
+        mse_fp8 = (x - fp8.float() * inv_s).pow(2).mean()
         mse_12 = (x - dequantize_tcfp12(quantize_tcfp12(x))).pow(2).mean()
         mse_16 = (x - dequantize_tcfp16(quantize_tcfp16(x))).pow(2).mean()
 
-        assert mse_8 > mse_12 > mse_16, (
-            f"Quality not monotonic: MSE-8={mse_8:.6f}, MSE-12={mse_12:.6f}, MSE-16={mse_16:.6f}"
+        assert mse_fp8 > mse_12 > mse_16, (
+            f"Quality not monotonic: MSE-FP8={mse_fp8:.6f}, "
+            f"MSE-12={mse_12:.6f}, MSE-16={mse_16:.6f}"
         )
 
 

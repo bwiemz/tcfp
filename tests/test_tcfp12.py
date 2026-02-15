@@ -19,22 +19,22 @@ DEVICE = "cuda"
 
 class TestQuantizeTCFP12:
     def test_roundtrip_quality(self) -> None:
-        """TCFP-12 should have lower MSE than plain FP8."""
-        from tcfp.tcfp8 import dequantize_tcfp8, quantize_tcfp8
+        """TCFP-12 should have lower MSE than naive FP8."""
+        from tcfp.core import to_fp8_e4m3
 
         torch.manual_seed(42)
         x = torch.randn(32, 256, device=DEVICE)
 
-        # TCFP-8
-        tcfp8 = quantize_tcfp8(x)
-        mse_8 = (x - dequantize_tcfp8(tcfp8)).pow(2).mean()
+        # Naive FP8 (per-tensor scale)
+        fp8, inv_s = to_fp8_e4m3(x)
+        mse_fp8 = (x - fp8.float() * inv_s).pow(2).mean()
 
         # TCFP-12
         tcfp12 = quantize_tcfp12(x)
         mse_12 = (x - dequantize_tcfp12(tcfp12)).pow(2).mean()
 
         # TCFP-12 must be strictly better
-        assert mse_12 < mse_8, f"TCFP-12 MSE ({mse_12:.6f}) not better than TCFP-8 ({mse_8:.6f})"
+        assert mse_12 < mse_fp8, f"TCFP-12 MSE ({mse_12:.6f}) not better than FP8 ({mse_fp8:.6f})"
 
     def test_output_types(self) -> None:
         x = torch.randn(8, 64, device=DEVICE)
@@ -73,8 +73,8 @@ class TestQuantizeTCFP12:
         assert mse < 0.01, f"MSE too high: {mse:.6f}"
 
     def test_snr_improvement(self) -> None:
-        """Signal-to-noise ratio should be significantly better than FP8."""
-        from tcfp.tcfp8 import dequantize_tcfp8, quantize_tcfp8
+        """Signal-to-noise ratio should be significantly better than naive FP8."""
+        from tcfp.core import to_fp8_e4m3
 
         torch.manual_seed(42)
         x = torch.randn(64, 256, device=DEVICE)
@@ -82,17 +82,18 @@ class TestQuantizeTCFP12:
         # SNR = 10 * log10(signal_power / noise_power)
         signal_power = x.pow(2).mean()
 
-        # TCFP-8
-        noise_8 = (x - dequantize_tcfp8(quantize_tcfp8(x))).pow(2).mean()
-        snr_8 = 10 * torch.log10(signal_power / noise_8)
+        # Naive FP8
+        fp8, inv_s = to_fp8_e4m3(x)
+        noise_fp8 = (x - fp8.float() * inv_s).pow(2).mean()
+        snr_fp8 = 10 * torch.log10(signal_power / noise_fp8)
 
         # TCFP-12
         noise_12 = (x - dequantize_tcfp12(quantize_tcfp12(x))).pow(2).mean()
         snr_12 = 10 * torch.log10(signal_power / noise_12)
 
-        # TCFP-12 should have at least 6 dB better SNR (~4 bits improvement would be 24 dB)
-        assert snr_12 > snr_8 + 3, (
-            f"SNR improvement insufficient: TCFP-12={snr_12:.1f}dB, TCFP-8={snr_8:.1f}dB"
+        # TCFP-12 should have at least 6 dB better SNR
+        assert snr_12 > snr_fp8 + 3, (
+            f"SNR improvement insufficient: TCFP-12={snr_12:.1f}dB, FP8={snr_fp8:.1f}dB"
         )
 
 

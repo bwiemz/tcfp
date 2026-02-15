@@ -279,7 +279,7 @@ class TestTCFPLinearTensorCores:
         )
         convert_to_tcfp(
             model,
-            mode=TCFPMode.TCFP8,
+            mode=TCFPMode.TCFP12,
             skip_patterns=(),
             use_tensor_cores=True,
         )
@@ -294,7 +294,7 @@ class TestTCFPLinearTensorCores:
         )
         convert_to_tcfp(
             model,
-            mode=TCFPMode.TCFP8,
+            mode=TCFPMode.TCFP12,
             skip_patterns=(),
             use_tensor_cores=True,
         )
@@ -331,7 +331,7 @@ class TestTensorCoreConvergence:
         ).to(DEVICE)
         convert_to_tcfp(
             model,
-            mode=TCFPMode.TCFP8,
+            mode=TCFPMode.TCFP12,
             skip_patterns=(),
             use_tensor_cores=True,
         )
@@ -363,7 +363,7 @@ class TestTensorCoreConvergence:
         ).to(DEVICE)
         convert_to_tcfp(
             model,
-            mode=TCFPMode.TCFP8,
+            mode=TCFPMode.TCFP12,
             skip_patterns=(),
             use_tensor_cores=True,
         )

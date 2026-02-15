@@ -22,8 +22,12 @@ from tcfp.core import (
     fp8_matmul,
     to_fp8_e4m3,
 )
+from tcfp.kernels import (
+    block_quantize_fp8,
+    block_scaled_gemm,
+    is_triton_available,
+)
 from tcfp.nn import convert_to_tcfp
-from tcfp.tcfp8 import fake_quantize_tcfp8
 from tcfp.tcfp12 import fake_quantize_tcfp12
 from tcfp.tcfp16 import (
     fake_quantize_tcfp16,
@@ -112,15 +116,6 @@ def benchmark_quality() -> None:
                 f"{max_abs_error(x, fp8_recon):<10.2e}"
             )
 
-            # TCFP-8
-            tcfp8_recon = fake_quantize_tcfp8(x)
-            bpv8 = f"{bits_per_value(TCFPMode.TCFP8):.1f}"
-            print(
-                f"  {'':<16} {'TCFP-8':<14} {bpv8:<7} "
-                f"{mse(x, tcfp8_recon):<12.2e} {snr_db(x, tcfp8_recon):<10.1f} "
-                f"{max_abs_error(x, tcfp8_recon):<10.2e}"
-            )
-
             # TCFP-12
             tcfp12_recon = fake_quantize_tcfp12(x)
             bpv12 = f"{bits_per_value(TCFPMode.TCFP12):.1f}"
@@ -160,22 +155,21 @@ def benchmark_fake_quantize_throughput() -> None:
     shapes = [(256, 512), (1024, 1024), (4096, 4096)]
 
     print(
-        f"\n  {'Shape':<16} {'BF16 cast':<12} {'TCFP-8':<12} "
+        f"\n  {'Shape':<16} {'BF16 cast':<12} "
         f"{'TCFP-12':<12} {'TCFP-12-Enh':<12} {'TCFP-16':<12}"
     )
-    print(f"  {'-' * 16} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}")
+    print(f"  {'-' * 16} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}")
 
     for shape in shapes:
         x = torch.randn(*shape, device=DEVICE)
 
         t_bf16 = time_fn(lambda: x.bfloat16().float())
-        t_8 = time_fn(lambda: fake_quantize_tcfp8(x))
         t_12 = time_fn(lambda: fake_quantize_tcfp12(x))
         t_12e = time_fn(lambda: fake_quantize_tcfp12(x, nf4_residual=True, nf_aware_scaling=True))
         t_16 = time_fn(lambda: fake_quantize_tcfp16(x))
 
         print(
-            f"  {str(shape):<16} {t_bf16:<12.3f} {t_8:<12.3f} "
+            f"  {str(shape):<16} {t_bf16:<12.3f} "
             f"{t_12:<12.3f} {t_12e:<12.3f} {t_16:<12.3f}"
         )
 
@@ -291,7 +285,7 @@ def benchmark_tensor_core_gemm() -> None:
 
         # Fake-quantize + F.linear (current TCFP path)
         def fq_fn() -> None:
-            w_q = fake_quantize_tcfp8(w)
+            w_q = fake_quantize_tcfp12(w)
             torch.nn.functional.linear(x, w_q)
 
         t_fq = time_fn(fq_fn)
@@ -300,6 +294,88 @@ def benchmark_tensor_core_gemm() -> None:
         print(
             f"  {str((M, K, N)):<24} {t_bf16:<12.3f} "
             f"{t_tc:<12.3f} {t_2gemm:<12.3f} {t_fq:<12.3f} {speedup:<12}"
+        )
+
+
+# ── Benchmark 3c: Block-Scaled GEMM ──────────────────────────────────
+
+
+def benchmark_block_scaled_gemm() -> None:
+    """Compare per-tensor vs per-block FP8 GEMM with Triton kernels."""
+    if not is_triton_available():
+        print("\n  [SKIPPED] Benchmark 3c: Triton not available")
+        return
+
+    print("\n" + "=" * 70)
+    print("  BENCHMARK 3c: Block-Scaled GEMM (ms per call)")
+    print("=" * 70)
+
+    shapes = [
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+    ]
+
+    print(
+        f"\n  {'(M,K,N)':<24} {'BF16 mm':<12} "
+        f"{'FP8 TC':<12} {'Block-32':<12} {'Block-64':<12} {'Block-128':<12}"
+    )
+    print(
+        f"  {'-' * 24} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}"
+    )
+
+    for M, K, N in shapes:
+        a = torch.randn(M, K, device=DEVICE)
+        b = torch.randn(N, K, device=DEVICE)  # (N, K) row-major
+
+        # BF16 matmul
+        a_bf = a.bfloat16()
+        b_bf = b.bfloat16()
+        t_bf16 = time_fn(lambda: a_bf @ b_bf.t())
+
+        # Per-tensor FP8 TC
+        a_fp8, sa = to_fp8_e4m3(a)
+        b_fp8, sb = to_fp8_e4m3(b)
+        b_fp8_t = b_fp8.t()
+
+        def fp8_tc_fn() -> None:
+            torch._scaled_mm(  # pyright: ignore[reportPrivateUsage]
+                a_fp8, b_fp8_t,
+                scale_a=sa, scale_b=sb,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+
+        t_tc = time_fn(fp8_tc_fn)
+
+        # Per-block FP8 with Triton kernel
+        block_times: list[float] = []
+        for bs in (32, 64, 128):
+            a_bq, a_bs = block_quantize_fp8(a, block_size=bs)
+            b_bq, b_bs = block_quantize_fp8(b, block_size=bs)
+            t = time_fn(lambda: block_scaled_gemm(a_bq, b_bq, a_bs, b_bs, block_size=bs))
+            block_times.append(t)
+
+        print(
+            f"  {str((M, K, N)):<24} {t_bf16:<12.3f} "
+            f"{t_tc:<12.3f} {block_times[0]:<12.3f} "
+            f"{block_times[1]:<12.3f} {block_times[2]:<12.3f}"
+        )
+
+    # Also benchmark quantization overhead
+    print("\n  Block Quantize Overhead (ms):")
+    print(f"  {'Shape':<24} {'Block-32':<12} {'Block-64':<12} {'Block-128':<12}")
+    print(f"  {'-' * 24} {'-' * 12} {'-' * 12} {'-' * 12}")
+
+    for M, K, _N in shapes:
+        x = torch.randn(M, K, device=DEVICE)
+        quant_times: list[float] = []
+        for bs in (32, 64, 128):
+            t = time_fn(lambda: block_quantize_fp8(x, block_size=bs))
+            quant_times.append(t)
+        print(
+            f"  {str((M, K)):<24} {quant_times[0]:<12.3f} "
+            f"{quant_times[1]:<12.3f} {quant_times[2]:<12.3f}"
         )
 
 
@@ -331,17 +407,24 @@ def benchmark_training_step() -> None:
 
     configs: list[tuple[str, TCFPMode | None, dict]] = [
         ("BF16 baseline", None, {}),
-        ("TCFP-8", TCFPMode.TCFP8, {}),
-        ("TCFP-8 TC", TCFPMode.TCFP8, {"use_tensor_cores": True}),
-        ("TCFP-8 TC+NF", TCFPMode.TCFP8, {
-            "use_tensor_cores": True, "nf_aware_scaling": True,
-        }),
         ("TCFP-12", TCFPMode.TCFP12, {}),
         ("TCFP-12 TC", TCFPMode.TCFP12, {"use_tensor_cores": True}),
         ("TCFP-12 TC+DS", TCFPMode.TCFP12, {
             "use_tensor_cores": True, "delayed_scaling": True,
         }),
+        ("TCFP-12 TC+Fused", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "use_fused_kernel": True,
+        }),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
+        ("TCFP-12 TC+B32", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 32,
+        }),
+        ("TCFP-12 TC+B64", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 64,
+        }),
+        ("TCFP-12 TC+B128", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 128,
+        }),
         ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
 
@@ -388,7 +471,6 @@ def benchmark_vram() -> None:
         ("FP32", 32.0),
         ("BF16", 16.0),
         ("FP8", 8.0),
-        ("TCFP-8", bits_per_value(TCFPMode.TCFP8)),
         ("TCFP-12", bits_per_value(TCFPMode.TCFP12)),
         ("TCFP-16", bits_per_value(TCFPMode.TCFP16)),
     ]
@@ -413,6 +495,7 @@ def main() -> None:
     benchmark_fake_quantize_throughput()
     benchmark_matmul_throughput()
     benchmark_tensor_core_gemm()
+    benchmark_block_scaled_gemm()
     benchmark_training_step()
     benchmark_vram()
 

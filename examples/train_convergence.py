@@ -13,8 +13,7 @@ Two real training tasks to validate that TCFP modes actually converge:
 
 For each task, we train with:
   - BF16 baseline (FP32 master weights, BF16 forward)
-  - TCFP-8
-  - TCFP-12  ← the one we care about most
+  - TCFP-12  (multiple variants: fake-quant, TC, TC+DS, TC+Fused, enhanced, block-scaled)
   - TCFP-16
 
 Reports: final loss, accuracy/perplexity, loss curve stability.
@@ -441,17 +440,24 @@ def main() -> None:
 
     configs: list[tuple[str, TCFPMode | None, dict]] = [
         ("BF16 baseline", None, {}),
-        ("TCFP-8", TCFPMode.TCFP8, {}),
-        ("FP8-TC", TCFPMode.TCFP8, {"use_tensor_cores": True}),
-        ("FP8-TC-NF", TCFPMode.TCFP8, {
-            "use_tensor_cores": True, "nf_aware_scaling": True,
-        }),
         ("TCFP-12", TCFPMode.TCFP12, {}),
         ("TCFP-12-TC", TCFPMode.TCFP12, {"use_tensor_cores": True}),
         ("TCFP-12-TC-DS", TCFPMode.TCFP12, {
             "use_tensor_cores": True, "delayed_scaling": True,
         }),
+        ("TCFP-12-TC-Fused", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "use_fused_kernel": True,
+        }),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
+        ("TCFP-12-TC-B32", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 32,
+        }),
+        ("TCFP-12-TC-B64", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 64,
+        }),
+        ("TCFP-12-TC-B128", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "scale_block_size": 128,
+        }),
         ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
 
@@ -619,6 +625,29 @@ def main() -> None:
         ds_ms = tcfp12ds_gpt["ms_per_step"]
         print(f"    BF16:          loss={bf_l:.4f}, ms/step={bf_ms:.1f}")
         print(f"    TCFP-12-TC-DS: loss={ds_l:.4f}, ms/step={ds_ms:.1f}")
+
+    # Block-scaled comparisons
+    for bname in ("TCFP-12-TC-B32", "TCFP-12-TC-B64", "TCFP-12-TC-B128"):
+        b_results = [r for r in gpt_results if r["mode"] == bname]
+        if bf16_results and b_results and len(bf16_results) > 1:
+            bf16_gpt = bf16_results[1]
+            b_gpt = b_results[0]
+            ppl_ratio_b = b_gpt["perplexity"] / bf16_gpt["perplexity"]
+            qual_b = (
+                "similar"
+                if 0.9 < ppl_ratio_b < 1.1
+                else ("degraded" if ppl_ratio_b > 1 else "better")
+            )
+            print(f"\n  {bname} vs BF16 (TinyGPT):")
+            print(f"    Perplexity ratio: {ppl_ratio_b:.3f}x ({qual_b})")
+            print(
+                f"    BF16:    loss={bf16_gpt['final_loss']:.4f}, "
+                f"ms/step={bf16_gpt['ms_per_step']:.1f}"
+            )
+            print(
+                f"    {bname}: loss={b_gpt['final_loss']:.4f}, "
+                f"ms/step={b_gpt['ms_per_step']:.1f}"
+            )
 
     print("\n" + "=" * 72)
 

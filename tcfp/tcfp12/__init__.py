@@ -29,7 +29,7 @@ Compute: FP8 tensor core matmul for the main term + cheap scalar
 
 Effective precision: ~5-6 mantissa bits (vs 3 for FP8, 7 for BF16)
 
-Enhanced features (from AXS-6 / TCFP-8, all optional):
+Enhanced features (all optional):
   - NF4 residual: NormalFloat-optimised 4-bit codebook for residuals
   - NF-aware scaling: sigma-based block scales for Gaussian weights
   - Stochastic rounding: unbiased rounding for training convergence

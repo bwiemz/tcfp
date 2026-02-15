@@ -55,24 +55,22 @@ class TestTCFP12TCForward:
 
     def test_better_than_single_fp8(self) -> None:
         """2-GEMM residual should be more accurate than single FP8 GEMM."""
+        from tcfp.core import fp8_matmul, to_fp8_e4m3
+
         torch.manual_seed(42)
-        # TCFP-12 TC (2-GEMM)
         layer_12 = TCFPLinear(
             256, 128, mode=TCFPMode.TCFP12, use_tensor_cores=True
         ).to(DEVICE)
-        # Single FP8 TC
-        layer_8 = TCFPLinear(
-            256, 128, mode=TCFPMode.TCFP8, use_tensor_cores=True
-        ).to(DEVICE)
-        with torch.no_grad():
-            layer_8.weight.copy_(layer_12.weight)
-            layer_8.bias.copy_(layer_12.bias)  # type: ignore[union-attr]
 
         x = torch.randn(16, 256, device=DEVICE)
         with torch.no_grad():
             ref = torch.nn.functional.linear(x, layer_12.weight, layer_12.bias)
             out_12 = layer_12(x)
-            out_8 = layer_8(x)
+
+            # Single FP8 GEMM for comparison (weight is out x in, need K x N)
+            x_fp8, sx = to_fp8_e4m3(x)
+            w_fp8, sw = to_fp8_e4m3(layer_12.weight.t().contiguous())
+            out_8 = fp8_matmul(x_fp8, w_fp8, sx, sw) + layer_12.bias
 
         err_12 = (out_12 - ref).abs().mean().item()
         err_8 = (out_8 - ref).abs().mean().item()
@@ -306,34 +304,33 @@ class TestTCFP12TCConvergence:
             loss.backward()
             opt.step()
 
-    def test_better_convergence_than_fp8(self) -> None:
-        """TCFP-12 TC should converge better than single FP8 TC."""
+    def test_converges_to_low_loss(self) -> None:
+        """TCFP-12 TC should converge to a low loss on simple regression."""
         torch.manual_seed(42)
         x = torch.randn(32, 128, device=DEVICE)
         target = torch.randn(32, 32, device=DEVICE)
 
-        def train_model(mode: TCFPMode) -> float:
-            torch.manual_seed(42)
-            model = nn.Sequential(
-                nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 32)
-            ).to(DEVICE)
-            convert_to_tcfp(
-                model, mode=mode,
-                skip_patterns=(), use_tensor_cores=True,
-            )
-            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-            loss = torch.tensor(0.0)
-            for _ in range(100):
-                opt.zero_grad()
-                loss = (model(x) - target).pow(2).mean()
-                loss.backward()
-                opt.step()
-            return loss.item()
+        model = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 32)
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model, mode=TCFPMode.TCFP12,
+            skip_patterns=(), use_tensor_cores=True,
+        )
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        first_loss = 0.0
+        last_loss = 0.0
+        for i in range(100):
+            opt.zero_grad()
+            loss = (model(x) - target).pow(2).mean()
+            if i == 0:
+                first_loss = loss.item()
+            last_loss = loss.item()
+            loss.backward()
+            opt.step()
 
-        loss_12 = train_model(TCFPMode.TCFP12)
-        loss_8 = train_model(TCFPMode.TCFP8)
-        assert loss_12 <= loss_8 * 1.1, (
-            f"TCFP-12 loss {loss_12:.6f} should be <= FP8 {loss_8:.6f}"
+        assert last_loss < first_loss * 0.1, (
+            f"Loss didn't converge enough: {first_loss:.4f} -> {last_loss:.4f}"
         )
 
 

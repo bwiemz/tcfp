@@ -177,13 +177,12 @@ class TestConfig:
             FP8Config(block_size=48)
 
     def test_bits_per_value(self) -> None:
-        assert bits_per_value(TCFPMode.TCFP8) == 8.25
         assert bits_per_value(TCFPMode.TCFP12) == 12.5
         assert bits_per_value(TCFPMode.TCFP16) == 16.5
 
     def test_default_config(self) -> None:
         cfg = FP8Config()
-        assert cfg.mode == TCFPMode.TCFP8
+        assert cfg.mode == TCFPMode.TCFP12
         assert cfg.block_size == 32
         assert cfg.e4m3_for_weights is True
         assert cfg.e5m2_for_grads is True

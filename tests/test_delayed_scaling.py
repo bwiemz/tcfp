@@ -34,7 +34,8 @@ class TestDelayedScaleState:
         state.get_delayed_amax("w", torch.tensor(1.0, device=DEVICE))
         # Many calls with 2.0 should push the EMA toward 2.0
         # decay=0.999 → half-life ≈ 693 steps, need ~5000 for <0.1 error
-        for _ in range(5000):
+        result = state.get_delayed_amax("w", torch.tensor(2.0, device=DEVICE))
+        for _ in range(4999):
             result = state.get_delayed_amax("w", torch.tensor(2.0, device=DEVICE))
         assert abs(result.item() - 2.0) < 0.1
 
@@ -384,11 +385,11 @@ class TestDelayedScalingAPI:
                 use_tensor_cores=False, delayed_scaling=True,
             )
 
-    def test_delayed_scaling_with_tcfp8_warns(self) -> None:
+    def test_delayed_scaling_with_tcfp16_warns(self) -> None:
         """Warning when delayed_scaling used with non-TCFP12."""
         with pytest.warns(UserWarning, match="only supported for TCFP12"):
             TCFPLinear(
-                128, 64, mode=TCFPMode.TCFP8,
+                128, 64, mode=TCFPMode.TCFP16,
                 use_tensor_cores=True, delayed_scaling=True,
             )
 

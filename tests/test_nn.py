@@ -26,13 +26,13 @@ DEVICE = "cuda"
 class TestSTEFakeQuantize:
     def test_forward_changes_values(self) -> None:
         x = torch.randn(4, 64, device=DEVICE, requires_grad=True)
-        out = ste_fake_quantize(x, TCFPMode.TCFP8)
+        out = ste_fake_quantize(x, TCFPMode.TCFP12)
         assert not torch.allclose(x, out, atol=1e-7)
 
     def test_gradient_passes_through(self) -> None:
         """STE should pass gradients through unchanged."""
         x = torch.randn(4, 64, device=DEVICE, requires_grad=True)
-        out = ste_fake_quantize(x, TCFPMode.TCFP8)
+        out = ste_fake_quantize(x, TCFPMode.TCFP12)
         loss = out.sum()
         loss.backward()
         # STE: grad should be all ones (from sum)
@@ -51,19 +51,19 @@ class TestSTEFakeQuantize:
 
 class TestTCFPLinear:
     def test_forward_shape(self) -> None:
-        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP12).to(DEVICE)
         x = torch.randn(4, 128, device=DEVICE)
         out = layer(x)
         assert out.shape == (4, 64)
 
     def test_batched_forward(self) -> None:
-        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP12).to(DEVICE)
         x = torch.randn(2, 8, 128, device=DEVICE)
         out = layer(x)
         assert out.shape == (2, 8, 64)
 
     def test_backward(self) -> None:
-        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP12).to(DEVICE)
         x = torch.randn(4, 128, device=DEVICE, requires_grad=True)
         out = layer(x)
         loss = out.sum()
@@ -73,7 +73,7 @@ class TestTCFPLinear:
         assert x.grad is not None
 
     def test_no_bias(self) -> None:
-        layer = TCFPLinear(64, 32, bias=False, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLinear(64, 32, bias=False, mode=TCFPMode.TCFP12).to(DEVICE)
         assert layer.bias is None
         x = torch.randn(4, 64, device=DEVICE)
         out = layer(x)
@@ -99,14 +99,14 @@ class TestTCFPLinear:
 
 class TestTCFPLayerNorm:
     def test_forward_shape(self) -> None:
-        layer = TCFPLayerNorm(128, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLayerNorm(128, mode=TCFPMode.TCFP12).to(DEVICE)
         x = torch.randn(4, 8, 128, device=DEVICE)
         out = layer(x)
         assert out.shape == (4, 8, 128)
 
     def test_normalized_output(self) -> None:
         """Output should be approximately normalized along the last dim."""
-        layer = TCFPLayerNorm(128, mode=TCFPMode.TCFP8).to(DEVICE)
+        layer = TCFPLayerNorm(128, mode=TCFPMode.TCFP12).to(DEVICE)
         x = torch.randn(4, 128, device=DEVICE) * 10 + 5
         out = layer(x)
         # Should be roughly zero-mean, unit-var after normalization
@@ -120,13 +120,13 @@ class TestTCFPLayerNorm:
 
 class TestTCFPEmbedding:
     def test_forward_shape(self) -> None:
-        emb = TCFPEmbedding(1000, 128, mode=TCFPMode.TCFP8).to(DEVICE)
+        emb = TCFPEmbedding(1000, 128, mode=TCFPMode.TCFP12).to(DEVICE)
         idx = torch.randint(0, 1000, (4, 16), device=DEVICE)
         out = emb(idx)
         assert out.shape == (4, 16, 128)
 
     def test_padding_idx(self) -> None:
-        emb = TCFPEmbedding(100, 64, padding_idx=0, mode=TCFPMode.TCFP8).to(DEVICE)
+        emb = TCFPEmbedding(100, 64, padding_idx=0, mode=TCFPMode.TCFP12).to(DEVICE)
         idx = torch.zeros(4, dtype=torch.long, device=DEVICE)
         out = emb(idx)
         # Padding embedding should be close to zero (may not be exactly zero after quantize)
@@ -147,7 +147,7 @@ class TestModelConversion:
 
     def test_convert_replaces_layers(self) -> None:
         model = self._make_simple_model().to(DEVICE)
-        convert_to_tcfp(model, mode=TCFPMode.TCFP8, block_size=32)
+        convert_to_tcfp(model, mode=TCFPMode.TCFP12, block_size=32)
 
         # Check types
         assert isinstance(model[0], TCFPEmbedding)
@@ -158,7 +158,7 @@ class TestModelConversion:
     def test_convert_preserves_weights(self) -> None:
         model = self._make_simple_model().to(DEVICE)
         original_weight = model[1].weight.data.clone()
-        convert_to_tcfp(model, mode=TCFPMode.TCFP8)
+        convert_to_tcfp(model, mode=TCFPMode.TCFP12)
         assert torch.equal(model[1].weight.data, original_weight)
 
     def test_skip_patterns(self) -> None:
@@ -189,7 +189,7 @@ class TestModelConversion:
             nn.LayerNorm(64),
             nn.Linear(64, 32),
         ).to(DEVICE)
-        convert_to_tcfp(model, mode=TCFPMode.TCFP8, block_size=32)
+        convert_to_tcfp(model, mode=TCFPMode.TCFP12, block_size=32)
 
         x = torch.randn(4, 128, device=DEVICE)
         out = model(x)
