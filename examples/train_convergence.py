@@ -447,6 +447,7 @@ def main() -> None:
             "use_tensor_cores": True, "nf_aware_scaling": True,
         }),
         ("TCFP-12", TCFPMode.TCFP12, {}),
+        ("TCFP-12-TC", TCFPMode.TCFP12, {"use_tensor_cores": True}),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
         ("TCFP-16", TCFPMode.TCFP16, {}),
     ]

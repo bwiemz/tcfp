@@ -12,6 +12,8 @@ on every forward pass, then use FP8 tensor cores for the matmul.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -359,6 +361,187 @@ class _FP8TensorCoreFunction(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
+# Autograd: TCFP-12 Tensor Core GEMM (2-GEMM residual decomposition)
+# ---------------------------------------------------------------------------
+
+
+class _TCFP12TensorCoreFunction(torch.autograd.Function):
+    """
+    TCFP-12 on tensor cores via 2-GEMM residual FP8 decomposition.
+
+    Decomposes weight into two FP8 components: ``W ≈ W_hi + W_lo``, then
+    computes ``output = (A @ W_hi) + (A @ W_lo)`` using two FP8 GEMMs.
+    This achieves near-BF16 quality at better-than-BF16 speed.
+
+    Forward:  2 FP8 GEMMs (act @ W_hi + act @ W_lo)
+    Backward: 2 FP8 GEMMs for dX + 1 for dW = 5 total
+    """
+
+    @staticmethod
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        nf_aware_scaling: bool,
+        sigma_factor: float,
+        stochastic_rounding: bool,
+        hp_grad_weight: bool,
+        error_state: ErrorFeedbackState | None,
+        param_name: str,
+    ) -> torch.Tensor:
+        # --- 1. Error feedback on weight ---
+        w = weight.float()
+        if error_state is not None:
+            error_buf = error_state.get_error(param_name, w)
+            w = w + error_buf
+
+        # --- 2. Quantise W_hi (main component) ---
+        if nf_aware_scaling:
+            w_hi_fp8, w_hi_inv = to_fp8_e4m3_nf_aware(
+                w, sigma_factor, stochastic_rounding
+            )
+        else:
+            w_hi_fp8, w_hi_inv = to_fp8_e4m3(w)
+
+        # --- 3. Compute residual and quantise W_lo ---
+        residual = w - w_hi_fp8.float() * w_hi_inv
+        w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
+
+        # --- 4. Error feedback: store total quantisation error ---
+        if error_state is not None:
+            w_reconstructed = (
+                w_hi_fp8.float() * w_hi_inv + w_lo_fp8.float() * w_lo_inv
+            )
+            quant_error = weight.float() - w_reconstructed
+            error_state.update_error(param_name, quant_error)
+
+        # --- 5. Flatten input to 2D, quantise activation once ---
+        input_shape = input.shape
+        input_2d = (
+            input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
+        )
+        act_fp8, act_inv = to_fp8_e4m3(input_2d)
+
+        # --- 6. Two FP8 GEMMs: output = (act @ W_hi.T) + (act @ W_lo.T) ---
+        output_hi = torch._scaled_mm(
+            act_fp8,
+            w_hi_fp8.t(),
+            scale_a=act_inv,
+            scale_b=w_hi_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+        output_lo = torch._scaled_mm(
+            act_fp8,
+            w_lo_fp8.t(),
+            scale_a=act_inv,
+            scale_b=w_lo_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+        output_2d = output_hi + output_lo
+
+        # --- 7. Add bias and reshape ---
+        if bias is not None:
+            output_2d = output_2d + bias
+
+        output = output_2d.reshape(*input_shape[:-1], output_2d.shape[-1])
+
+        # --- 8. Save for backward ---
+        ctx.hp_grad_weight = hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
+        saved = [
+            input_2d if hp_grad_weight else act_fp8,
+            w_hi_fp8,
+            w_lo_fp8,
+            w_hi_inv,
+            w_lo_inv,
+            act_inv,
+        ]
+        if bias is not None:
+            saved.append(bias)
+        ctx.save_for_backward(*saved)
+
+        return output
+
+    @staticmethod
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        None, None, None, None, None, None,
+    ]:
+        saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
+        saved_act = saved[0]
+        w_hi_fp8, w_lo_fp8, w_hi_inv, w_lo_inv, act_inv = saved[1:6]
+        has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
+        hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
+
+        # --- 1. Flatten grad to 2D ---
+        grad_2d = (
+            grad_output.reshape(-1, grad_output.shape[-1])
+            if grad_output.ndim == 3
+            else grad_output
+        )
+
+        # --- 2. Quantise grad to FP8 E5M2 ---
+        grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
+
+        # --- 3. dX = grad @ W_hi + grad @ W_lo (2 GEMMs) ---
+        grad_input_hi = torch._scaled_mm(
+            grad_fp8,
+            ensure_column_major(w_hi_fp8),
+            scale_a=grad_inv,
+            scale_b=w_hi_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+        grad_input_lo = torch._scaled_mm(
+            grad_fp8,
+            ensure_column_major(w_lo_fp8),
+            scale_a=grad_inv,
+            scale_b=w_lo_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+        grad_input = (grad_input_hi + grad_input_lo).reshape(input_shape)
+
+        # --- 4. dW = grad.T @ activation (1 GEMM, no residual needed) ---
+        M = grad_2d.shape[0]
+        if hp_grad_weight:
+            grad_weight = grad_2d.t() @ saved_act
+        elif M % 16 != 0:
+            # _scaled_mm requires inner dim divisible by 16
+            grad_weight = grad_2d.t() @ (saved_act.float() * act_inv)
+        else:
+            grad_t_fp8 = grad_fp8.t().contiguous()
+            grad_weight = torch._scaled_mm(
+                grad_t_fp8,
+                ensure_column_major(saved_act),
+                scale_a=grad_inv,
+                scale_b=act_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+
+        # --- 5. dBias ---
+        grad_bias = grad_2d.sum(dim=0) if has_bias else None
+
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None, None, None, None, None, None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # TCFPLinear — Drop-in nn.Linear replacement
 # ---------------------------------------------------------------------------
 
@@ -405,6 +588,12 @@ class TCFPLinear(nn.Module):
         error_feedback: bool = True,
     ) -> None:
         super().__init__()
+        if nf4_residual and use_tensor_cores and mode == TCFPMode.TCFP12:
+            warnings.warn(
+                "nf4_residual is ignored in tensor core mode — NF4 cannot "
+                "run on tensor cores. The residual uses FP8 E4M3 instead.",
+                stacklevel=2,
+            )
         self.in_features = in_features
         self.out_features = out_features
         self.mode = mode
@@ -447,7 +636,12 @@ class TCFPLinear(nn.Module):
 
         # Tensor core path: real FP8 GEMMs via torch._scaled_mm
         if self.use_tensor_cores:
-            result: torch.Tensor = _FP8TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
+            tc_fn = (
+                _TCFP12TensorCoreFunction
+                if self.mode == TCFPMode.TCFP12
+                else _FP8TensorCoreFunction
+            )
+            result: torch.Tensor = tc_fn.apply(  # pyright: ignore[reportAssignmentType]
                 x,
                 self.weight,
                 self.bias,

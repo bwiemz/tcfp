@@ -240,9 +240,11 @@ def benchmark_tensor_core_gemm() -> None:
 
     print(
         f"\n  {'(M,K,N)':<24} {'BF16 mm':<12} "
-        f"{'FP8 TC':<12} {'FQ+F.lin':<12} {'TC speedup':<12}"
+        f"{'FP8 TC':<12} {'2-GEMM TC':<12} {'FQ+F.lin':<12} {'TC speedup':<12}"
     )
-    print(f"  {'-' * 24} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}")
+    print(
+        f"  {'-' * 24} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}"
+    )
 
     for M, K, N in shapes:
         x = torch.randn(M, K, device=DEVICE)
@@ -267,6 +269,26 @@ def benchmark_tensor_core_gemm() -> None:
 
         t_tc = time_fn(fp8_tc_fn)
 
+        # 2-GEMM residual (TCFP-12 TC): W_hi + W_lo
+        residual = w - w_fp8.float() * w_inv
+        w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
+        w_lo_fp8_t = w_lo_fp8.t()
+
+        def two_gemm_fn() -> None:
+            hi = torch._scaled_mm(  # pyright: ignore[reportPrivateUsage]
+                x_fp8, w_fp8_t,
+                scale_a=x_inv, scale_b=w_inv,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+            lo = torch._scaled_mm(  # pyright: ignore[reportPrivateUsage]
+                x_fp8, w_lo_fp8_t,
+                scale_a=x_inv, scale_b=w_lo_inv,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+            _ = hi + lo
+
+        t_2gemm = time_fn(two_gemm_fn)
+
         # Fake-quantize + F.linear (current TCFP path)
         def fq_fn() -> None:
             w_q = fake_quantize_tcfp8(w)
@@ -277,7 +299,7 @@ def benchmark_tensor_core_gemm() -> None:
         speedup = f"{t_bf16 / t_tc:.2f}x"
         print(
             f"  {str((M, K, N)):<24} {t_bf16:<12.3f} "
-            f"{t_tc:<12.3f} {t_fq:<12.3f} {speedup:<12}"
+            f"{t_tc:<12.3f} {t_2gemm:<12.3f} {t_fq:<12.3f} {speedup:<12}"
         )
 
 
@@ -315,6 +337,7 @@ def benchmark_training_step() -> None:
             "use_tensor_cores": True, "nf_aware_scaling": True,
         }),
         ("TCFP-12", TCFPMode.TCFP12, {}),
+        ("TCFP-12 TC", TCFPMode.TCFP12, {"use_tensor_cores": True}),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
         ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
