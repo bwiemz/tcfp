@@ -67,10 +67,10 @@ class TCFP16Tensor:
         original_shape: Shape of the original tensor.
     """
 
-    hi_fp8: torch.Tensor          # float8_e4m3fn, shape (..., D)
-    lo_fp8: torch.Tensor          # float8_e4m3fn, shape (..., D)
-    hi_scales: torch.Tensor       # float32, shape (..., D // block_size)
-    lo_scales: torch.Tensor       # float32, shape (..., D // block_size)
+    hi_fp8: torch.Tensor  # float8_e4m3fn, shape (..., D)
+    lo_fp8: torch.Tensor  # float8_e4m3fn, shape (..., D)
+    hi_scales: torch.Tensor  # float32, shape (..., D // block_size)
+    lo_scales: torch.Tensor  # float32, shape (..., D // block_size)
     block_size: int = DEFAULT_BLOCK_SIZE
     original_shape: tuple[int, ...] = field(default_factory=tuple)
 
@@ -157,9 +157,7 @@ def dequantize_tcfp16(tcfp16: TCFP16Tensor) -> torch.Tensor:
     hi_values = tcfp16.hi_fp8.float()
 
     # Low-order component (in scaled space)
-    lo_values_blocked = tcfp16.lo_fp8.float().reshape(
-        *batch_dims, num_blocks, tcfp16.block_size
-    )
+    lo_values_blocked = tcfp16.lo_fp8.float().reshape(*batch_dims, num_blocks, tcfp16.block_size)
     lo_reconstructed = lo_values_blocked * tcfp16.lo_scales.unsqueeze(-1)
     lo_flat = lo_reconstructed.reshape(*batch_dims, D)
 
@@ -236,17 +234,13 @@ def tcfp16_matmul(
 
     # Dequantize components with their block scales
     a_hi = _dequant_component(a.hi_fp8, a.hi_scales, a.block_size)
-    a_lo = _dequant_component(a.lo_fp8, a.lo_scales, a.block_size)
+    _a_lo = _dequant_component(a.lo_fp8, a.lo_scales, a.block_size)
     # For lo, also need to apply hi_scale since lo is in hi-scaled space
     # Actually lo_scales are relative to the hi-scaled space
-    a_lo_full = _dequant_component_nested(
-        a.lo_fp8, a.lo_scales, a.hi_scales, a.block_size
-    )
+    a_lo_full = _dequant_component_nested(a.lo_fp8, a.lo_scales, a.hi_scales, a.block_size)
 
     b_hi = _dequant_component(b.hi_fp8, b.hi_scales, b.block_size)
-    b_lo_full = _dequant_component_nested(
-        b.lo_fp8, b.lo_scales, b.hi_scales, b.block_size
-    )
+    b_lo_full = _dequant_component_nested(b.lo_fp8, b.lo_scales, b.hi_scales, b.block_size)
 
     # Per-tensor scale and cast for each component
     a_hi_fp8, sa_hi = _to_fp8_per_tensor(a_hi)
@@ -303,5 +297,5 @@ def _to_fp8_per_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     scale = (FP8_E4M3_MAX / amax).float()
     scaled = (tensor * scale).clamp(FP8_E4M3_MIN, FP8_E4M3_MAX)
     fp8 = scaled.to(torch.float8_e4m3fn)
-    inv_scale = (torch.ones(1, device=tensor.device, dtype=torch.float32) / scale)
+    inv_scale = torch.ones(1, device=tensor.device, dtype=torch.float32) / scale
     return fp8, inv_scale

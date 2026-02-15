@@ -27,7 +27,6 @@ from __future__ import annotations
 import math
 import sys
 import time
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -117,12 +116,8 @@ def generate_fake_mnist(
     train_x, train_y = make_data(n_train)
     test_x, test_y = make_data(n_test)
 
-    train_loader = DataLoader(
-        TensorDataset(train_x, train_y), batch_size=128, shuffle=True
-    )
-    test_loader = DataLoader(
-        TensorDataset(test_x, test_y), batch_size=256, shuffle=False
-    )
+    train_loader = DataLoader(TensorDataset(train_x, train_y), batch_size=128, shuffle=True)
+    test_loader = DataLoader(TensorDataset(test_x, test_y), batch_size=256, shuffle=False)
     return train_loader, test_loader
 
 
@@ -131,33 +126,37 @@ def train_mnist(
     mode: TCFPMode | None,
     epochs: int = 10,
     lr: float = 1e-3,
+    extra_kwargs: dict | None = None,
 ) -> dict:
     """Train MNIST and return metrics."""
-    # Make dimensions divisible by 32: pad 784 → 800 internally
-    # Actually 256 is divisible by 32, so hidden layers are fine.
-    # 784 is NOT divisible by 32, so fc1 won't be converted — that's fine,
-    # it acts as an unquantized input projection.
+    if extra_kwargs is None:
+        extra_kwargs = {}
 
     model = MNISTNet(hidden=256).to(DEVICE)
     if mode is not None:
-        convert_to_tcfp(model, mode=mode, block_size=32, skip_patterns=())
+        convert_to_tcfp(model, mode=mode, block_size=32, skip_patterns=(), **extra_kwargs)
 
     train_loader, test_loader = generate_fake_mnist()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     loss_history: list[float] = []
+    step_times_ms: list[float] = []
 
-    for epoch in range(epochs):
+    for _epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         n_batches = 0
         for images, labels in train_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
+            torch.cuda.synchronize()
+            t_step_start = time.perf_counter()
             optimizer.zero_grad()
             logits = model(images)
             loss = F.cross_entropy(logits, labels)
             loss.backward()
             optimizer.step()
+            torch.cuda.synchronize()
+            step_times_ms.append((time.perf_counter() - t_step_start) * 1000)
             epoch_loss += loss.item()
             n_batches += 1
         avg_loss = epoch_loss / n_batches
@@ -175,12 +174,15 @@ def train_mnist(
             total += labels.size(0)
 
     accuracy = correct / total
+    # Skip first 10 steps (warmup) for timing
+    avg_ms_step = sum(step_times_ms[10:]) / max(1, len(step_times_ms) - 10)
     return {
         "mode": mode_name,
         "final_loss": loss_history[-1],
         "accuracy": accuracy,
         "loss_history": loss_history,
         "converged": loss_history[-1] < loss_history[0] * 0.5,  # Loss halved
+        "ms_per_step": avg_ms_step,
     }
 
 
@@ -216,7 +218,7 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # Scaled dot-product attention with causal mask
-        attn = (q @ k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        attn = (q @ k.transpose(-2, -1)) / (self.d_head**0.5)
         mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         attn = attn.masked_fill(mask, float("-inf"))
         attn = F.softmax(attn, dim=-1)
@@ -302,7 +304,7 @@ def generate_synthetic_text(
                 data[i, t] = (start + step * t + noise) % vocab_size
         elif pattern == 1:
             # Repeating motif of length 4-8
-            motif_len = torch.randint(4, 9, (1,)).item()
+            motif_len = int(torch.randint(4, 9, (1,)).item())
             motif = torch.randint(0, vocab_size, (motif_len,))
             for t in range(seq_len):
                 noise = torch.randint(0, 2, (1,)).item() if torch.rand(1).item() < 0.05 else 0
@@ -322,14 +324,17 @@ def train_tinygpt(
     mode: TCFPMode | None,
     steps: int = 1000,
     lr: float = 3e-4,
+    extra_kwargs: dict | None = None,
 ) -> dict:
     """Train TinyGPT and return metrics."""
+    if extra_kwargs is None:
+        extra_kwargs = {}
     cfg = TinyGPTConfig()
     model = TinyGPT(cfg).to(DEVICE)
 
     if mode is not None:
         # Skip the head (tied with embeddings) to avoid double-conversion issues
-        convert_to_tcfp(model, mode=mode, block_size=32, skip_patterns=("head",))
+        convert_to_tcfp(model, mode=mode, block_size=32, skip_patterns=("head",), **extra_kwargs)
 
     n_params = sum(p.numel() for p in model.parameters())
     loader = generate_synthetic_text(n_sequences=4000, seq_len=cfg.max_seq_len)
@@ -338,6 +343,7 @@ def train_tinygpt(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
 
     loss_history: list[float] = []
+    step_times_ms: list[float] = []
     step = 0
     model.train()
 
@@ -349,6 +355,9 @@ def train_tinygpt(
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
 
+            torch.cuda.synchronize()
+            t_step_start = time.perf_counter()
+
             logits = model(inputs)
             loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
 
@@ -358,22 +367,32 @@ def train_tinygpt(
             optimizer.step()
             scheduler.step()
 
+            torch.cuda.synchronize()
+            step_times_ms.append((time.perf_counter() - t_step_start) * 1000)
+
             loss_history.append(loss.item())
             step += 1
 
             if step % 100 == 0:
-                print(f"    [{mode_name}] step {step}/{steps}, loss={loss.item():.4f}")
+                avg_ms = sum(step_times_ms[-100:]) / min(100, len(step_times_ms))
+                print(
+                    f"    [{mode_name}] step {step}/{steps}, "
+                    f"loss={loss.item():.4f}, ms/step={avg_ms:.1f}"
+                )
 
     # Final evaluation: compute perplexity on last 50 steps
     avg_final_loss = sum(loss_history[-50:]) / 50
     perplexity = math.exp(min(avg_final_loss, 20))  # Cap to avoid overflow
 
     # Check for NaN/explosion
-    has_nan = any(math.isnan(l) or math.isinf(l) for l in loss_history)
+    has_nan = any(math.isnan(v) or math.isinf(v) for v in loss_history)
 
     # Check loss decreased meaningfully (at least 20% from initial)
     early_avg = sum(loss_history[:20]) / 20
     converged = avg_final_loss < early_avg * 0.8 and not has_nan
+
+    # Skip first 20 steps (warmup) for timing
+    avg_ms_step = sum(step_times_ms[20:]) / max(1, len(step_times_ms) - 20)
 
     return {
         "mode": mode_name,
@@ -384,6 +403,7 @@ def train_tinygpt(
         "has_nan": has_nan,
         "converged": converged,
         "initial_loss": early_avg,
+        "ms_per_step": avg_ms_step,
     }
 
 
@@ -404,8 +424,7 @@ def print_loss_sparkline(history: list[float], width: int = 40) -> str:
         return "▁" * len(sampled)
     chars = " ▁▂▃▄▅▆▇█"
     return "".join(
-        chars[min(len(chars) - 1, int((v - lo) / (hi - lo) * (len(chars) - 1)))]
-        for v in sampled
+        chars[min(len(chars) - 1, int((v - lo) / (hi - lo) * (len(chars) - 1)))] for v in sampled
     )
 
 
@@ -420,97 +439,151 @@ def main() -> None:
     print(f"  PyTorch: {torch.__version__}")
     print("=" * 72)
 
-    configs = [
-        ("BF16 baseline", None),
-        ("TCFP-8", TCFPMode.TCFP8),
-        ("TCFP-12", TCFPMode.TCFP12),
-        ("TCFP-16", TCFPMode.TCFP16),
+    configs: list[tuple[str, TCFPMode | None, dict]] = [
+        ("BF16 baseline", None, {}),
+        ("TCFP-8", TCFPMode.TCFP8, {}),
+        ("FP8-TC", TCFPMode.TCFP8, {"use_tensor_cores": True}),
+        ("FP8-TC-NF", TCFPMode.TCFP8, {
+            "use_tensor_cores": True, "nf_aware_scaling": True,
+        }),
+        ("TCFP-12", TCFPMode.TCFP12, {}),
+        ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
+        ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
 
-    # ── MNIST ─────────────────────────────────────────────────────────
-    print("\n" + "─" * 72)
+    # -- MNIST ---------------------------------------------------------
+    print("\n" + "-" * 72)
     print("  TEST 1: MNIST Classification (3-layer MLP, 10 epochs)")
-    print("─" * 72)
+    print("-" * 72)
 
     mnist_results = []
-    for name, mode in configs:
+    for name, mode, extra_kwargs in configs:
         print(f"\n  Training {name}...")
         t0 = time.perf_counter()
-        result = train_mnist(name, mode)
+        result = train_mnist(name, mode, extra_kwargs=extra_kwargs)
         elapsed = time.perf_counter() - t0
         result["time"] = elapsed
         mnist_results.append(result)
-        status = "✓ CONVERGED" if result["converged"] else "✗ FAILED"
-        print(f"    {status}: loss={result['final_loss']:.4f}, "
-              f"acc={result['accuracy']:.1%}, time={elapsed:.1f}s")
+        status = "OK CONVERGED" if result["converged"] else "FAIL FAILED"
+        print(
+            f"    {status}: loss={result['final_loss']:.4f}, "
+            f"acc={result['accuracy']:.1%}, time={elapsed:.1f}s"
+        )
 
-    print(f"\n  {'Config':<18} {'Final Loss':<12} {'Accuracy':<10} {'Status':<14} {'Loss Curve'}")
-    print(f"  {'-'*18} {'-'*12} {'-'*10} {'-'*14} {'-'*40}")
+    print(
+        f"\n  {'Config':<18} {'Final Loss':<12} {'Accuracy':<10} "
+        f"{'ms/step':<10} {'Status':<14} {'Loss Curve'}"
+    )
+    print(f"  {'-' * 18} {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 14} {'-' * 40}")
     for r in mnist_results:
         status = "CONVERGED" if r["converged"] else "FAILED"
         sparkline = print_loss_sparkline(r["loss_history"])
-        print(f"  {r['mode']:<18} {r['final_loss']:<12.4f} {r['accuracy']:<10.1%} "
-              f"{status:<14} {sparkline}")
+        print(
+            f"  {r['mode']:<18} {r['final_loss']:<12.4f} {r['accuracy']:<10.1%} "
+            f"{r['ms_per_step']:<10.1f} {status:<14} {sparkline}"
+        )
 
-    # ── TinyGPT ──────────────────────────────────────────────────────
-    print("\n" + "─" * 72)
+    # -- TinyGPT ------------------------------------------------------
+    print("\n" + "-" * 72)
     print("  TEST 2: TinyGPT Language Model (4L, d=256, 500 steps)")
-    print("─" * 72)
+    print("-" * 72)
 
     gpt_results = []
-    for name, mode in configs:
+    for name, mode, extra_kwargs in configs:
         print(f"\n  Training {name}...")
         t0 = time.perf_counter()
-        result = train_tinygpt(name, mode, steps=500)
+        result = train_tinygpt(name, mode, steps=500, extra_kwargs=extra_kwargs)
         elapsed = time.perf_counter() - t0
         result["time"] = elapsed
         gpt_results.append(result)
-        status = "✓ CONVERGED" if result["converged"] else "✗ FAILED"
+        status = "OK CONVERGED" if result["converged"] else "FAIL FAILED"
         nan_warn = " [NaN!]" if result["has_nan"] else ""
-        print(f"    {status}: loss={result['final_loss']:.4f}, "
-              f"ppl={result['perplexity']:.1f}, time={elapsed:.1f}s{nan_warn}")
+        print(
+            f"    {status}: loss={result['final_loss']:.4f}, "
+            f"ppl={result['perplexity']:.1f}, ms/step={result['ms_per_step']:.1f}, "
+            f"time={elapsed:.1f}s{nan_warn}"
+        )
 
-    print(f"\n  {'Config':<18} {'Init Loss':<12} {'Final Loss':<12} {'PPL':<10} "
-          f"{'Status':<14} {'Loss Curve'}")
-    print(f"  {'-'*18} {'-'*12} {'-'*12} {'-'*10} {'-'*14} {'-'*40}")
+    print(
+        f"\n  {'Config':<18} {'Init Loss':<12} {'Final Loss':<12} "
+        f"{'PPL':<10} {'ms/step':<10} {'Status':<14} {'Loss Curve'}"
+    )
+    print(f"  {'-' * 18} {'-' * 12} {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 14} {'-' * 40}")
     for r in gpt_results:
         status = "CONVERGED" if r["converged"] else "FAILED"
         if r["has_nan"]:
             status = "NaN/INF"
         sparkline = print_loss_sparkline(r["loss_history"])
-        print(f"  {r['mode']:<18} {r['initial_loss']:<12.4f} {r['final_loss']:<12.4f} "
-              f"{r['perplexity']:<10.1f} {status:<14} {sparkline}")
+        print(
+            f"  {r['mode']:<18} {r['initial_loss']:<12.4f} {r['final_loss']:<12.4f} "
+            f"{r['perplexity']:<10.1f} {r['ms_per_step']:<10.1f} "
+            f"{status:<14} {sparkline}"
+        )
 
-    # ── Summary ──────────────────────────────────────────────────────
+    # -- Summary ------------------------------------------------------
     print("\n" + "=" * 72)
     print("  SUMMARY")
     print("=" * 72)
 
     all_converged = all(r["converged"] for r in mnist_results + gpt_results)
-    tcfp12_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12"]
     bf16_results = [r for r in mnist_results + gpt_results if r["mode"] == "BF16 baseline"]
+    tcfp12_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12"]
+    tcfp12e_results = [r for r in mnist_results + gpt_results if r["mode"] == "TCFP-12-Enh"]
 
     print(f"\n  All modes converged: {'YES' if all_converged else 'NO'}")
 
-    if tcfp12_results and bf16_results:
-        # MNIST comparison
-        tcfp12_mnist = tcfp12_results[0]
+    if bf16_results and tcfp12_results:
         bf16_mnist = bf16_results[0]
+        tcfp12_mnist = tcfp12_results[0]
         acc_gap = bf16_mnist["accuracy"] - tcfp12_mnist["accuracy"]
-        print(f"\n  TCFP-12 vs BF16 (MNIST):")
-        print(f"    Accuracy gap: {acc_gap:+.1%} "
-              f"({'BF16 better' if acc_gap > 0 else 'TCFP-12 better'})")
+        print("\n  TCFP-12 vs BF16 (MNIST):")
+        print(
+            f"    Accuracy gap: {acc_gap:+.1%} "
+            f"({'BF16 better' if acc_gap > 0 else 'TCFP-12 better'})"
+        )
+        print(f"    ms/step ratio: {tcfp12_mnist['ms_per_step'] / bf16_mnist['ms_per_step']:.2f}x")
 
-        # GPT comparison
-        if len(tcfp12_results) > 1 and len(bf16_results) > 1:
-            tcfp12_gpt = tcfp12_results[1]
-            bf16_gpt = bf16_results[1]
-            ppl_ratio = tcfp12_gpt["perplexity"] / bf16_gpt["perplexity"]
-            print(f"\n  TCFP-12 vs BF16 (TinyGPT):")
-            print(f"    Perplexity ratio: {ppl_ratio:.3f}x "
-                  f"({'similar' if 0.9 < ppl_ratio < 1.1 else 'degraded' if ppl_ratio > 1 else 'better'})")
-            print(f"    BF16 final loss:    {bf16_gpt['final_loss']:.4f}")
-            print(f"    TCFP-12 final loss: {tcfp12_gpt['final_loss']:.4f}")
+    if bf16_results and tcfp12e_results:
+        bf16_mnist = bf16_results[0]
+        tcfp12e_mnist = tcfp12e_results[0]
+        acc_gap_e = bf16_mnist["accuracy"] - tcfp12e_mnist["accuracy"]
+        print("\n  TCFP-12-Enhanced vs BF16 (MNIST):")
+        print(
+            f"    Accuracy gap: {acc_gap_e:+.1%} "
+            f"({'BF16 better' if acc_gap_e > 0 else 'TCFP-12-Enh better'})"
+        )
+        print(f"    ms/step ratio: {tcfp12e_mnist['ms_per_step'] / bf16_mnist['ms_per_step']:.2f}x")
+
+    # GPT comparison
+    if len(bf16_results) > 1 and len(tcfp12_results) > 1:
+        bf16_gpt = bf16_results[1]
+        tcfp12_gpt = tcfp12_results[1]
+        ppl_ratio = tcfp12_gpt["perplexity"] / bf16_gpt["perplexity"]
+        print("\n  TCFP-12 vs BF16 (TinyGPT):")
+        qual = "similar" if 0.9 < ppl_ratio < 1.1 else ("degraded" if ppl_ratio > 1 else "better")
+        print(f"    Perplexity ratio: {ppl_ratio:.3f}x ({qual})")
+        bf_l = bf16_gpt["final_loss"]
+        bf_ms = bf16_gpt["ms_per_step"]
+        t12_l = tcfp12_gpt["final_loss"]
+        t12_ms = tcfp12_gpt["ms_per_step"]
+        print(f"    BF16:    loss={bf_l:.4f}, ms/step={bf_ms:.1f}")
+        print(f"    TCFP-12: loss={t12_l:.4f}, ms/step={t12_ms:.1f}")
+
+    if len(bf16_results) > 1 and len(tcfp12e_results) > 1:
+        bf16_gpt = bf16_results[1]
+        tcfp12e_gpt = tcfp12e_results[1]
+        ppl_ratio_e = tcfp12e_gpt["perplexity"] / bf16_gpt["perplexity"]
+        print("\n  TCFP-12-Enhanced vs BF16 (TinyGPT):")
+        qual_e = (
+            "similar" if 0.9 < ppl_ratio_e < 1.1 else ("degraded" if ppl_ratio_e > 1 else "better")
+        )
+        print(f"    Perplexity ratio: {ppl_ratio_e:.3f}x ({qual_e})")
+        bf_l = bf16_gpt["final_loss"]
+        bf_ms = bf16_gpt["ms_per_step"]
+        e_l = tcfp12e_gpt["final_loss"]
+        e_ms = tcfp12e_gpt["ms_per_step"]
+        print(f"    BF16:        loss={bf_l:.4f}, ms/step={bf_ms:.1f}")
+        print(f"    TCFP-12-Enh: loss={e_l:.4f}, ms/step={e_ms:.1f}")
 
     print("\n" + "=" * 72)
 

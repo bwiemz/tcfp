@@ -1,9 +1,9 @@
 """TCFP Neural Network Modules"""
 
 from tcfp.nn import (
-    TCFPLinear,
-    TCFPLayerNorm,
     TCFPEmbedding,
+    TCFPLayerNorm,
+    TCFPLinear,
     convert_to_tcfp,
     ste_fake_quantize,
 )

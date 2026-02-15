@@ -15,9 +15,7 @@ from tcfp.nn import (
     ste_fake_quantize,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 DEVICE = "cuda"
 
@@ -164,10 +162,12 @@ class TestModelConversion:
         assert torch.equal(model[1].weight.data, original_weight)
 
     def test_skip_patterns(self) -> None:
-        model = nn.ModuleDict({
-            "encoder": nn.Linear(128, 64),
-            "head": nn.Linear(64, 10),
-        }).to(DEVICE)
+        model = nn.ModuleDict(
+            {
+                "encoder": nn.Linear(128, 64),
+                "head": nn.Linear(64, 10),
+            }
+        ).to(DEVICE)
         convert_to_tcfp(model, skip_patterns=("head",))
         assert isinstance(model["encoder"], TCFPLinear)
         assert isinstance(model["head"], nn.Linear)  # Should NOT be converted
@@ -195,3 +195,82 @@ class TestModelConversion:
         out = model(x)
         assert out.shape == (4, 32)
         assert torch.isfinite(out).all()
+
+    def test_convert_with_enhanced_options(self) -> None:
+        """convert_to_tcfp should pass TCFP-12 enhancement kwargs."""
+        model = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.Linear(64, 32),
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model,
+            mode=TCFPMode.TCFP12,
+            nf4_residual=True,
+            nf_aware_scaling=True,
+            stochastic_rounding=True,
+            warmup_steps=5,
+        )
+        assert isinstance(model[0], TCFPLinear)
+        assert model[0].nf4_residual is True
+        assert model[0].nf_aware_scaling is True
+        assert model[0].stochastic_rounding is True
+        assert model[0]._warmup_steps == 5
+
+
+# ── Enhanced Module Features ────────────────────────────────────────────
+
+
+class TestWarmup:
+    def test_warmup_skips_quantization(self) -> None:
+        """During warmup, output should match FP32 linear."""
+        layer = TCFPLinear(64, 32, mode=TCFPMode.TCFP12, warmup_steps=3).to(DEVICE)
+        ref = nn.Linear(64, 32).to(DEVICE)
+        ref.weight = layer.weight
+        ref.bias = layer.bias
+
+        x = torch.randn(4, 64, device=DEVICE)
+        # First call is warmup — should match FP32
+        out_warmup = layer(x)
+        out_ref = ref(x)
+        assert torch.allclose(out_warmup, out_ref, atol=1e-6), (
+            "Warmup output doesn't match FP32 linear"
+        )
+
+    def test_warmup_ends(self) -> None:
+        """After warmup_steps, quantization should resume."""
+        layer = TCFPLinear(64, 32, mode=TCFPMode.TCFP12, warmup_steps=2).to(DEVICE)
+        ref = nn.Linear(64, 32).to(DEVICE)
+        ref.weight = layer.weight
+        ref.bias = layer.bias
+
+        x = torch.randn(4, 64, device=DEVICE)
+
+        # Consume warmup steps
+        layer(x)
+        layer(x)
+
+        # Third call — quantization should be active
+        out_quant = layer(x)
+        out_ref = ref(x)
+        # Quantized output should differ from FP32
+        assert not torch.allclose(out_quant, out_ref, atol=1e-6), (
+            "Quantization not active after warmup ended"
+        )
+
+
+class TestLazyEmbedding:
+    def test_lazy_embedding_shape(self) -> None:
+        """Lazy embedding should produce correct output shape."""
+        emb = TCFPEmbedding(1000, 128, mode=TCFPMode.TCFP12).to(DEVICE)
+        idx = torch.randint(0, 1000, (4, 16), device=DEVICE)
+        out = emb(idx)
+        assert out.shape == (4, 16, 128)
+
+    def test_lazy_embedding_gradient(self) -> None:
+        """Lazy embedding should support backpropagation."""
+        emb = TCFPEmbedding(100, 64, mode=TCFPMode.TCFP12).to(DEVICE)
+        idx = torch.randint(0, 100, (4,), device=DEVICE)
+        out = emb(idx)
+        loss = out.sum()
+        loss.backward()
+        assert emb.weight.grad is not None

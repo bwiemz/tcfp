@@ -3,8 +3,8 @@ TCFP-8 Quantization
 """
 
 from tcfp.tcfp8 import (
-    TCFP8Tensor,
     ErrorFeedbackState,
+    TCFP8Tensor,
     dequantize_tcfp8,
     fake_quantize_tcfp8,
     quantize_tcfp8,

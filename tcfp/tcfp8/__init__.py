@@ -29,51 +29,10 @@ from tcfp.core import (
     DEFAULT_BLOCK_SIZE,
     FP8_E4M3_MAX,
     FP8_E4M3_MIN,
+    ErrorFeedbackState,
     compute_block_scales,
+    compute_nf_aware_scales,
 )
-
-
-# ---------------------------------------------------------------------------
-# NormalFloat-aware scaling
-# ---------------------------------------------------------------------------
-
-
-def compute_nf_aware_scales(
-    tensor: torch.Tensor,
-    block_size: int = DEFAULT_BLOCK_SIZE,
-    sigma_factor: float = 3.0,
-) -> torch.Tensor:
-    """
-    Compute block scales optimised for Gaussian-distributed values.
-
-    Instead of scaling to the block maximum (which wastes dynamic range
-    on outliers), we scale to ``sigma_factor * std`` of the block.
-    Values beyond this range are clipped — but for Gaussian data, only
-    ~0.3% of values exceed 3σ, and clipping them causes minimal MSE.
-
-    Args:
-        tensor: Input tensor, shape ``(..., D)``.
-        block_size: Block size.
-        sigma_factor: Number of standard deviations to cover (default 3.0).
-
-    Returns:
-        Block scales of shape ``(..., D // block_size)``.
-    """
-    *batch_dims, D = tensor.shape
-    num_blocks = D // block_size
-    blocked = tensor.reshape(*batch_dims, num_blocks, block_size)
-
-    # Per-block standard deviation
-    block_std = blocked.float().std(dim=-1, correction=0).clamp(min=1e-12)
-    block_amax = blocked.float().abs().amax(dim=-1).clamp(min=1e-12)
-    target_max = sigma_factor * block_std
-    # Fall back to amax for near-constant blocks (std ≈ 0)
-    target_max = torch.where(block_std < 1e-6, block_amax, target_max)
-
-    # Power-of-2 scale
-    raw_exp = torch.ceil(torch.log2(target_max / FP8_E4M3_MAX))
-    scales = torch.exp2(raw_exp)
-    return scales
 
 
 def compute_amax_scales(
@@ -84,48 +43,6 @@ def compute_amax_scales(
     Standard amax-based block scaling (fallback, same as naive FP8).
     """
     return compute_block_scales(tensor, block_size, FP8_E4M3_MAX)
-
-
-# ---------------------------------------------------------------------------
-# Error Feedback State
-# ---------------------------------------------------------------------------
-
-
-class ErrorFeedbackState:
-    """
-    Per-parameter error feedback buffers for TCFP-8.
-
-    Tracks the quantisation error from each step and adds it back
-    to the next quantisation input, ensuring unbiased long-term rounding.
-    """
-
-    def __init__(self) -> None:
-        self._buffers: dict[str, torch.Tensor] = {}
-        self._amax_ema: dict[str, torch.Tensor] = {}
-        self._ema_decay: float = 0.999
-
-    def get_error(self, name: str, like: torch.Tensor) -> torch.Tensor:
-        if name not in self._buffers or self._buffers[name].shape != like.shape:
-            self._buffers[name] = torch.zeros_like(like)
-        return self._buffers[name]
-
-    def update_error(self, name: str, error: torch.Tensor) -> None:
-        self._buffers[name] = error.detach()
-
-    def get_amax_ema(self, name: str, current_amax: torch.Tensor) -> torch.Tensor:
-        """Get smoothed amax via exponential moving average."""
-        if name not in self._amax_ema:
-            self._amax_ema[name] = current_amax.detach().clone()
-        else:
-            self._amax_ema[name] = (
-                self._ema_decay * self._amax_ema[name]
-                + (1 - self._ema_decay) * current_amax.detach()
-            )
-        return self._amax_ema[name]
-
-    def reset(self) -> None:
-        self._buffers.clear()
-        self._amax_ema.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +62,8 @@ class TCFP8Tensor:
         original_shape: Shape of the original tensor.
     """
 
-    data_fp8: torch.Tensor        # float8_e4m3fn
-    block_scales: torch.Tensor    # float32, shape (..., D // block_size)
+    data_fp8: torch.Tensor  # float8_e4m3fn
+    block_scales: torch.Tensor  # float32, shape (..., D // block_size)
     block_size: int = DEFAULT_BLOCK_SIZE
     original_shape: tuple[int, ...] = field(default_factory=tuple)
 
@@ -212,9 +129,7 @@ def quantize_tcfp8(
 
     # Compute and store error for feedback
     if error_state is not None:
-        reconstructed = dequantize_tcfp8(
-            TCFP8Tensor(data_fp8, scales, block_size, original_shape)
-        )
+        reconstructed = dequantize_tcfp8(TCFP8Tensor(data_fp8, scales, block_size, original_shape))
         quantisation_error = tensor.float() - reconstructed
         error_state.update_error(param_name, quantisation_error)
 

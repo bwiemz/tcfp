@@ -18,15 +18,16 @@ import torch.nn.functional as F
 
 from tcfp.core import (
     DEFAULT_BLOCK_SIZE,
-    FP8_E4M3_MAX,
-    FP8_E4M3_MIN,
+    ErrorFeedbackState,
     TCFPMode,
-    fp8_matmul,
+    ensure_column_major,
+    to_fp8_e4m3,
+    to_fp8_e4m3_nf_aware,
+    to_fp8_e5m2,
 )
-from tcfp.tcfp8 import fake_quantize_tcfp8, quantize_tcfp8, dequantize_tcfp8
+from tcfp.tcfp8 import fake_quantize_tcfp8
 from tcfp.tcfp12 import fake_quantize_tcfp12
 from tcfp.tcfp16 import fake_quantize_tcfp16
-
 
 # ---------------------------------------------------------------------------
 # Autograd: STE Fake-Quantize
@@ -42,32 +43,62 @@ class _STEFakeQuantize(torch.autograd.Function):
         x: torch.Tensor,
         mode: TCFPMode,
         block_size: int,
+        nf4_residual: bool,
+        nf_aware_scaling: bool,
+        sigma_factor: float,
+        stochastic_rounding: bool,
     ) -> torch.Tensor:
         if mode == TCFPMode.TCFP8:
             return fake_quantize_tcfp8(x, block_size=block_size)
         elif mode == TCFPMode.TCFP12:
-            return fake_quantize_tcfp12(x, block_size=block_size)
+            return fake_quantize_tcfp12(
+                x,
+                block_size=block_size,
+                nf4_residual=nf4_residual,
+                nf_aware_scaling=nf_aware_scaling,
+                sigma_factor=sigma_factor,
+                stochastic_rounding=stochastic_rounding,
+            )
         elif mode == TCFPMode.TCFP16:
             return fake_quantize_tcfp16(x, block_size=block_size)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
     @staticmethod
-    def backward(
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
         # STE: pass gradient through unchanged
-        return grad_output, None, None
+        return grad_output, None, None, None, None, None, None
 
 
 def ste_fake_quantize(
     x: torch.Tensor,
     mode: TCFPMode = TCFPMode.TCFP8,
     block_size: int = DEFAULT_BLOCK_SIZE,
+    *,
+    nf4_residual: bool = False,
+    nf_aware_scaling: bool = False,
+    sigma_factor: float = 3.0,
+    stochastic_rounding: bool = False,
 ) -> torch.Tensor:
-    """Apply fake-quantize with STE gradient."""
-    return _STEFakeQuantize.apply(x, mode, block_size)
+    """
+    Apply fake-quantize with STE gradient.
+
+    The TCFP-12 enhancement kwargs (nf4_residual, nf_aware_scaling,
+    sigma_factor, stochastic_rounding) are only used when mode is TCFP12.
+    """
+    result: torch.Tensor = _STEFakeQuantize.apply(  # pyright: ignore[reportAssignmentType]
+        x,
+        mode,
+        block_size,
+        nf4_residual,
+        nf_aware_scaling,
+        sigma_factor,
+        stochastic_rounding,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +110,7 @@ class _FP8LinearFunction(torch.autograd.Function):
     """
     Linear layer using FP8 tensor cores.
 
-    Forward: quantize weight → FP8 matmul (tensor cores)
+    Forward: quantize weight -> FP8 matmul (tensor cores)
     Backward: STE for weight, standard gradient for input
     """
 
@@ -91,34 +122,68 @@ class _FP8LinearFunction(torch.autograd.Function):
         bias: torch.Tensor | None,
         mode: TCFPMode,
         block_size: int,
+        nf4_residual: bool,
+        nf_aware_scaling: bool,
+        sigma_factor: float,
+        stochastic_rounding: bool,
     ) -> torch.Tensor:
-        ctx.save_for_backward(input, weight, bias)
-        ctx.mode = mode
-        ctx.block_size = block_size
+        ctx.save_for_backward(input, weight, bias)  # pyright: ignore[reportArgumentType]
+        ctx.mode = mode  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.block_size = block_size  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.nf4_residual = nf4_residual  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.nf_aware_scaling = nf_aware_scaling  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.sigma_factor = sigma_factor  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.stochastic_rounding = stochastic_rounding  # pyright: ignore[reportAttributeAccessIssue]
 
         # Fake-quantize weight
-        w_q = ste_fake_quantize(weight, mode, block_size)
+        w_q = ste_fake_quantize(
+            weight,
+            mode,
+            block_size,
+            nf4_residual=nf4_residual,
+            nf_aware_scaling=nf_aware_scaling,
+            sigma_factor=sigma_factor,
+            stochastic_rounding=stochastic_rounding,
+        )
 
         # Standard linear with quantized weight
         output = F.linear(input, w_q, bias)
         return output
 
     @staticmethod
-    def backward(
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, None, None]:
-        input, weight, bias = ctx.saved_tensors
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]:
+        input, weight, bias = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
 
         # Gradient w.r.t. input (use quantized weight for consistency)
-        w_q = ste_fake_quantize(weight, ctx.mode, ctx.block_size)
+        w_q = ste_fake_quantize(
+            weight,
+            ctx.mode,  # pyright: ignore[reportAttributeAccessIssue]
+            ctx.block_size,  # pyright: ignore[reportAttributeAccessIssue]
+            nf4_residual=ctx.nf4_residual,  # pyright: ignore[reportAttributeAccessIssue]
+            nf_aware_scaling=ctx.nf_aware_scaling,  # pyright: ignore[reportAttributeAccessIssue]
+            sigma_factor=ctx.sigma_factor,  # pyright: ignore[reportAttributeAccessIssue]
+            stochastic_rounding=ctx.stochastic_rounding,  # pyright: ignore[reportAttributeAccessIssue]
+        )
         grad_input = grad_output @ w_q
 
         # Gradient w.r.t. weight
         if grad_output.ndim == 3:
-            # Batched: (B, T, out) → reshape
-            B, T, O = grad_output.shape
-            grad_weight = grad_output.reshape(-1, O).t() @ input.reshape(-1, input.shape[-1])
+            # Batched: (B, T, out) -> reshape
+            _B, _T, out_dim = grad_output.shape
+            grad_weight = grad_output.reshape(-1, out_dim).t() @ input.reshape(-1, input.shape[-1])
         else:
             grad_weight = grad_output.t() @ input
 
@@ -127,7 +192,170 @@ class _FP8LinearFunction(torch.autograd.Function):
         if bias is not None:
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.ndim - 1)))
 
-        return grad_input, grad_weight, grad_bias, None, None
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Autograd: FP8 Tensor Core GEMM (real _scaled_mm)
+# ---------------------------------------------------------------------------
+
+
+class _FP8TensorCoreFunction(torch.autograd.Function):
+    """
+    Linear layer using real FP8 tensor core GEMMs via ``torch._scaled_mm``.
+
+    Forward: quantise both activation + weight to FP8, run FP8 GEMM.
+    Backward: quantise grad to FP8 E5M2, two more FP8 GEMMs for dX and dW.
+    """
+
+    @staticmethod
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        nf_aware_scaling: bool,
+        sigma_factor: float,
+        stochastic_rounding: bool,
+        hp_grad_weight: bool,
+        error_state: ErrorFeedbackState | None,
+        param_name: str,
+    ) -> torch.Tensor:
+        # --- 1. Error feedback on weight ---
+        w = weight.float()
+        if error_state is not None:
+            error_buf = error_state.get_error(param_name, w)
+            w = w + error_buf
+
+        # --- 2. Quantise weight to FP8 E4M3 ---
+        if nf_aware_scaling:
+            w_fp8, w_inv = to_fp8_e4m3_nf_aware(w, sigma_factor, stochastic_rounding)
+        else:
+            w_fp8, w_inv = to_fp8_e4m3(w)
+
+        # --- 3. Error feedback: store quantisation error ---
+        if error_state is not None:
+            w_dequant = w_fp8.float() * w_inv
+            quant_error = weight.float() - w_dequant
+            error_state.update_error(param_name, quant_error)
+
+        # --- 4. Flatten input to 2D ---
+        input_shape = input.shape
+        input_2d = input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
+
+        # --- 5. Quantise activation to FP8 E4M3 ---
+        act_fp8, act_inv = to_fp8_e4m3(input_2d)
+
+        # --- 6. FP8 GEMM: output = act @ weight.T ---
+        # w_fp8 is (D_out, D_in) row-major; w_fp8.t() is (D_in, D_out) col-major
+        output_2d = torch._scaled_mm(
+            act_fp8,
+            w_fp8.t(),
+            scale_a=act_inv,
+            scale_b=w_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+
+        # --- 7. Add bias and reshape ---
+        if bias is not None:
+            output_2d = output_2d + bias
+
+        output = output_2d.reshape(*input_shape[:-1], output_2d.shape[-1])
+
+        # --- 8. Save for backward ---
+        ctx.hp_grad_weight = hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
+        ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
+        saved = [input_2d if hp_grad_weight else act_fp8, w_fp8, w_inv, act_inv]
+        if bias is not None:
+            saved.append(bias)
+        ctx.save_for_backward(*saved)
+
+        return output
+
+    @staticmethod
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        None, None, None, None, None, None,
+    ]:
+        saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
+        saved_act, w_fp8, w_inv, act_inv = saved[:4]
+        has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
+        hp_grad_weight: bool = ctx.hp_grad_weight  # pyright: ignore[reportAttributeAccessIssue]
+        input_shape: tuple[int, ...] = ctx.input_shape  # pyright: ignore[reportAttributeAccessIssue]
+
+        # --- 1. Flatten grad to 2D ---
+        grad_2d = (
+            grad_output.reshape(-1, grad_output.shape[-1])
+            if grad_output.ndim == 3
+            else grad_output
+        )
+
+        # --- 2. Quantise grad to FP8 E5M2 (wider range for gradients) ---
+        grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
+
+        # --- 3. dX = grad_output @ weight ---
+        # grad_fp8: (M, D_out) row-major, w_fp8: (D_out, D_in) needs col-major
+        grad_input_2d = torch._scaled_mm(
+            grad_fp8,
+            ensure_column_major(w_fp8),
+            scale_a=grad_inv,
+            scale_b=w_inv,
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+        )
+
+        # Reshape to match input
+        grad_input = grad_input_2d.reshape(input_shape)
+
+        # --- 4. dW = grad.T @ activation ---
+        M = grad_2d.shape[0]
+        if hp_grad_weight:
+            # High-precision: FP32 matmul
+            grad_weight = grad_2d.t() @ saved_act
+        elif M % 16 != 0:
+            # _scaled_mm requires inner dim (M) divisible by 16.
+            # Fall back to FP32 for small/unaligned batch sizes.
+            grad_weight = grad_2d.t() @ (saved_act.float() * act_inv)
+        else:
+            # FP8 GEMM for dW
+            # grad.T: (D_out, M) — need contiguous row-major
+            grad_t_fp8 = grad_fp8.t().contiguous()
+            # act_fp8: (M, D_in) — need col-major
+            grad_weight = torch._scaled_mm(
+                grad_t_fp8,
+                ensure_column_major(saved_act),
+                scale_a=grad_inv,
+                scale_b=act_inv,
+                out_dtype=torch.float32,
+                use_fast_accum=False,
+            )
+
+        # --- 5. dBias ---
+        grad_bias = grad_2d.sum(dim=0) if has_bias else None
+
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None, None, None, None, None, None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +367,10 @@ class TCFPLinear(nn.Module):
     """
     Drop-in replacement for ``nn.Linear`` using TCFP quantisation.
 
-    Stores weights in FP32 (master copy). Forward pass applies
-    fake-quantise + FP8 tensor core matmul. Backward uses STE.
+    Stores weights in FP32 (master copy). Forward pass applies either:
+    - **Fake-quantise path** (default): STE fake-quantise + ``F.linear``
+    - **Tensor core path** (``use_tensor_cores=True``): real FP8 GEMMs
+      via ``torch._scaled_mm`` on FP8 tensor cores
 
     Args:
         in_features: Input feature dimension.
@@ -148,6 +378,13 @@ class TCFPLinear(nn.Module):
         bias: Whether to include a bias term.
         mode: TCFP precision mode.
         block_size: Block size for quantisation.
+        nf4_residual: Use NF4 codebook for residuals (TCFP-12 only).
+        nf_aware_scaling: Use sigma-based block scales.
+        stochastic_rounding: Use stochastic rounding.
+        warmup_steps: Number of initial steps to skip quantisation.
+        use_tensor_cores: Use real FP8 tensor core GEMMs.
+        hp_grad_weight: Compute weight gradient in FP32 instead of FP8.
+        error_feedback: Enable error feedback for tensor core path.
     """
 
     def __init__(
@@ -157,12 +394,35 @@ class TCFPLinear(nn.Module):
         bias: bool = True,
         mode: TCFPMode = TCFPMode.TCFP8,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        *,
+        nf4_residual: bool = False,
+        nf_aware_scaling: bool = False,
+        sigma_factor: float = 3.0,
+        stochastic_rounding: bool = False,
+        warmup_steps: int = 0,
+        use_tensor_cores: bool = False,
+        hp_grad_weight: bool = False,
+        error_feedback: bool = True,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.mode = mode
         self.block_size = block_size
+        self.nf4_residual = nf4_residual
+        self.nf_aware_scaling = nf_aware_scaling
+        self.sigma_factor = sigma_factor
+        self.stochastic_rounding = stochastic_rounding
+        self._warmup_steps = warmup_steps
+        self._warmup_remaining = warmup_steps
+        self.use_tensor_cores = use_tensor_cores
+        self.hp_grad_weight = hp_grad_weight
+
+        # Error feedback state for tensor core path
+        self._error_state: ErrorFeedbackState | None = None
+        if use_tensor_cores and error_feedback:
+            self._error_state = ErrorFeedbackState()
+        self._param_name: str = ""
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -180,16 +440,61 @@ class TCFPLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _FP8LinearFunction.apply(
-            x, self.weight, self.bias, self.mode, self.block_size
+        # During warmup, skip quantisation entirely
+        if self._warmup_remaining > 0:
+            self._warmup_remaining -= 1
+            return F.linear(x, self.weight, self.bias)
+
+        # Tensor core path: real FP8 GEMMs via torch._scaled_mm
+        if self.use_tensor_cores:
+            result: torch.Tensor = _FP8TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
+                x,
+                self.weight,
+                self.bias,
+                self.nf_aware_scaling,
+                self.sigma_factor,
+                self.stochastic_rounding,
+                self.hp_grad_weight,
+                self._error_state,
+                self._param_name,
+            )
+            return result
+
+        # Fake-quantise path: STE + F.linear
+        result = _FP8LinearFunction.apply(  # pyright: ignore[reportAssignmentType]
+            x,
+            self.weight,
+            self.bias,
+            self.mode,
+            self.block_size,
+            self.nf4_residual,
+            self.nf_aware_scaling,
+            self.sigma_factor,
+            self.stochastic_rounding,
         )
+        return result
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, mode={self.mode.name}, "
-            f"block_size={self.block_size}"
-        )
+        parts = [
+            f"in_features={self.in_features}",
+            f"out_features={self.out_features}",
+            f"bias={self.bias is not None}",
+            f"mode={self.mode.name}",
+            f"block_size={self.block_size}",
+        ]
+        if self.use_tensor_cores:
+            parts.append("use_tensor_cores=True")
+        if self.hp_grad_weight:
+            parts.append("hp_grad_weight=True")
+        if self.nf4_residual:
+            parts.append("nf4_residual=True")
+        if self.nf_aware_scaling:
+            parts.append("nf_aware_scaling=True")
+        if self.stochastic_rounding:
+            parts.append("stochastic_rounding=True")
+        if self._warmup_steps > 0:
+            parts.append(f"warmup_steps={self._warmup_steps}")
+        return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +516,10 @@ class TCFPLayerNorm(nn.Module):
         eps: float = 1e-5,
         mode: TCFPMode = TCFPMode.TCFP8,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        *,
+        nf4_residual: bool = False,
+        nf_aware_scaling: bool = False,
+        stochastic_rounding: bool = False,
     ) -> None:
         super().__init__()
         if isinstance(normalized_shape, int):
@@ -219,14 +528,22 @@ class TCFPLayerNorm(nn.Module):
         self.eps = eps
         self.mode = mode
         self.block_size = block_size
+        self.nf4_residual = nf4_residual
+        self.nf_aware_scaling = nf_aware_scaling
+        self.stochastic_rounding = stochastic_rounding
 
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Quantise the weight/bias, but output is full precision
+        # Quantise the weight (bias remains in full precision)
         w_q = ste_fake_quantize(
-            self.weight.unsqueeze(0), self.mode, self.block_size
+            self.weight.unsqueeze(0),
+            self.mode,
+            self.block_size,
+            nf4_residual=self.nf4_residual,
+            nf_aware_scaling=self.nf_aware_scaling,
+            stochastic_rounding=self.stochastic_rounding,
         ).squeeze(0)
         return F.layer_norm(x, self.normalized_shape, w_q, self.bias, self.eps)
 
@@ -240,7 +557,8 @@ class TCFPEmbedding(nn.Module):
     """
     Embedding with TCFP-quantised weight table.
 
-    Only accessed rows are quantised (lazy quantisation for efficiency).
+    Uses lazy quantisation: only the looked-up rows are quantised,
+    not the full embedding table.
     """
 
     def __init__(
@@ -250,6 +568,10 @@ class TCFPEmbedding(nn.Module):
         padding_idx: int | None = None,
         mode: TCFPMode = TCFPMode.TCFP8,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        *,
+        nf4_residual: bool = False,
+        nf_aware_scaling: bool = False,
+        stochastic_rounding: bool = False,
     ) -> None:
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -257,6 +579,9 @@ class TCFPEmbedding(nn.Module):
         self.padding_idx = padding_idx
         self.mode = mode
         self.block_size = block_size
+        self.nf4_residual = nf4_residual
+        self.nf_aware_scaling = nf_aware_scaling
+        self.stochastic_rounding = stochastic_rounding
 
         self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim))
         nn.init.normal_(self.weight)
@@ -265,10 +590,15 @@ class TCFPEmbedding(nn.Module):
                 self.weight[padding_idx].fill_(0)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        # Fake-quantise the full embedding table
-        w_q = ste_fake_quantize(self.weight, self.mode, self.block_size)
-        return F.embedding(
-            indices, w_q, padding_idx=self.padding_idx
+        # Lazy quantisation: look up first, then quantise only accessed rows
+        raw = F.embedding(indices, self.weight, padding_idx=self.padding_idx)
+        return ste_fake_quantize(
+            raw,
+            self.mode,
+            self.block_size,
+            nf4_residual=self.nf4_residual,
+            nf_aware_scaling=self.nf_aware_scaling,
+            stochastic_rounding=self.stochastic_rounding,
         )
 
 
@@ -282,46 +612,89 @@ def convert_to_tcfp(
     mode: TCFPMode = TCFPMode.TCFP8,
     block_size: int = DEFAULT_BLOCK_SIZE,
     skip_patterns: tuple[str, ...] = ("head",),
+    *,
+    nf4_residual: bool = False,
+    nf_aware_scaling: bool = False,
+    stochastic_rounding: bool = False,
+    warmup_steps: int = 0,
+    use_tensor_cores: bool = False,
+    hp_grad_weight: bool = False,
+    error_feedback: bool = True,
+    _parent_path: str = "",
 ) -> nn.Module:
     """
     Convert a model's layers to TCFP equivalents in-place.
 
     Replaces:
-      - nn.Linear → TCFPLinear
-      - nn.LayerNorm → TCFPLayerNorm
-      - nn.Embedding → TCFPEmbedding
+      - nn.Linear -> TCFPLinear
+      - nn.LayerNorm -> TCFPLayerNorm
+      - nn.Embedding -> TCFPEmbedding
 
     Args:
         model: The model to convert.
         mode: TCFP precision mode.
         block_size: Block size.
         skip_patterns: Layer name patterns to skip (keep in FP32).
+        nf4_residual: Use NF4 codebook for residuals (TCFP-12 only).
+        nf_aware_scaling: Use sigma-based block scales.
+        stochastic_rounding: Use stochastic rounding.
+        warmup_steps: Number of initial steps to skip quantisation.
+        use_tensor_cores: Use real FP8 tensor core GEMMs (TCFPLinear only).
+        hp_grad_weight: Compute weight gradient in FP32 (tensor core path).
+        error_feedback: Enable error feedback (tensor core path).
 
     Returns:
         The converted model (modified in-place).
     """
     for name, module in model.named_children():
+        full_path = f"{_parent_path}.{name}" if _parent_path else name
+
         # Recurse first
-        convert_to_tcfp(module, mode, block_size, skip_patterns)
+        convert_to_tcfp(
+            module,
+            mode,
+            block_size,
+            skip_patterns,
+            nf4_residual=nf4_residual,
+            nf_aware_scaling=nf_aware_scaling,
+            stochastic_rounding=stochastic_rounding,
+            warmup_steps=warmup_steps,
+            use_tensor_cores=use_tensor_cores,
+            hp_grad_weight=hp_grad_weight,
+            error_feedback=error_feedback,
+            _parent_path=full_path,
+        )
 
         # Skip patterns
         if any(pat in name for pat in skip_patterns):
             continue
 
         if isinstance(module, nn.Linear):
-            # Check if embedding_dim is divisible by block_size
             if module.in_features % block_size != 0:
                 continue
+            # _scaled_mm requires both dims divisible by 16
+            layer_tc = use_tensor_cores and (
+                module.in_features % 16 == 0
+                and module.out_features % 16 == 0
+            )
             new_module = TCFPLinear(
                 module.in_features,
                 module.out_features,
                 bias=module.bias is not None,
                 mode=mode,
                 block_size=block_size,
+                nf4_residual=nf4_residual,
+                nf_aware_scaling=nf_aware_scaling,
+                stochastic_rounding=stochastic_rounding,
+                warmup_steps=warmup_steps,
+                use_tensor_cores=layer_tc,
+                hp_grad_weight=hp_grad_weight,
+                error_feedback=error_feedback,
             )
-            new_module.weight = module.weight
+            new_module._param_name = full_path
+            new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
             if module.bias is not None:
-                new_module.bias = module.bias
+                new_module.bias = module.bias  # pyright: ignore[reportAttributeAccessIssue]
             setattr(model, name, new_module)
 
         elif isinstance(module, nn.LayerNorm):
@@ -329,13 +702,16 @@ def convert_to_tcfp(
             if isinstance(ns, (list, tuple)) and ns[-1] % block_size != 0:
                 continue
             new_module = TCFPLayerNorm(
-                ns,
+                tuple(ns) if isinstance(ns, list) else ns,
                 eps=module.eps,
                 mode=mode,
                 block_size=block_size,
+                nf4_residual=nf4_residual,
+                nf_aware_scaling=nf_aware_scaling,
+                stochastic_rounding=stochastic_rounding,
             )
-            new_module.weight = module.weight
-            new_module.bias = module.bias
+            new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
+            new_module.bias = module.bias  # pyright: ignore[reportAttributeAccessIssue]
             setattr(model, name, new_module)
 
         elif isinstance(module, nn.Embedding):
@@ -347,8 +723,11 @@ def convert_to_tcfp(
                 padding_idx=module.padding_idx,
                 mode=mode,
                 block_size=block_size,
+                nf4_residual=nf4_residual,
+                nf_aware_scaling=nf_aware_scaling,
+                stochastic_rounding=stochastic_rounding,
             )
-            new_module.weight = module.weight
+            new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
             setattr(model, name, new_module)
 
     return model

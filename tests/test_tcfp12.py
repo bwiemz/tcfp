@@ -7,15 +7,12 @@ import torch
 
 from tcfp.tcfp12 import (
     RESIDUAL_4BIT_MAX,
-    TCFP12Tensor,
     dequantize_tcfp12,
     fake_quantize_tcfp12,
     quantize_tcfp12,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 DEVICE = "cuda"
 
@@ -37,9 +34,7 @@ class TestQuantizeTCFP12:
         mse_12 = (x - dequantize_tcfp12(tcfp12)).pow(2).mean()
 
         # TCFP-12 must be strictly better
-        assert mse_12 < mse_8, (
-            f"TCFP-12 MSE ({mse_12:.6f}) not better than TCFP-8 ({mse_8:.6f})"
-        )
+        assert mse_12 < mse_8, f"TCFP-12 MSE ({mse_12:.6f}) not better than TCFP-8 ({mse_8:.6f})"
 
     def test_output_types(self) -> None:
         x = torch.randn(8, 64, device=DEVICE)

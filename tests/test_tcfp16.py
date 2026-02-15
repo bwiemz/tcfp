@@ -6,16 +6,13 @@ import pytest
 import torch
 
 from tcfp.tcfp16 import (
-    TCFP16Tensor,
     dequantize_tcfp16,
     fake_quantize_tcfp16,
     quantize_tcfp16,
     tcfp16_matmul,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 DEVICE = "cuda"
 
@@ -36,9 +33,7 @@ class TestQuantizeTCFP16:
         tcfp16 = quantize_tcfp16(x)
         mse_16 = (x - dequantize_tcfp16(tcfp16)).pow(2).mean()
 
-        assert mse_16 < mse_12, (
-            f"TCFP-16 MSE ({mse_16:.6f}) not better than TCFP-12 ({mse_12:.6f})"
-        )
+        assert mse_16 < mse_12, f"TCFP-16 MSE ({mse_16:.6f}) not better than TCFP-12 ({mse_12:.6f})"
 
     def test_near_bf16_quality(self) -> None:
         """TCFP-16 should approach BF16 quality (SNR > 40 dB on Gaussian)."""

@@ -7,7 +7,6 @@ import torch
 
 from tcfp.tcfp8 import (
     ErrorFeedbackState,
-    TCFP8Tensor,
     compute_amax_scales,
     compute_nf_aware_scales,
     dequantize_tcfp8,
@@ -15,9 +14,7 @@ from tcfp.tcfp8 import (
     quantize_tcfp8,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 DEVICE = "cuda"
 
@@ -155,7 +152,7 @@ class TestQuantizeTCFP8:
         # With error feedback
         state = ErrorFeedbackState()
         cumulative_ef = torch.zeros_like(x)
-        for i in range(10):
+        for _i in range(10):
             q = quantize_tcfp8(x, error_state=state, param_name="test")
             cumulative_ef += dequantize_tcfp8(q) - x
 

@@ -15,14 +15,10 @@ to ``fp8_matmul``, which dispatches to hardware FP8 tensor cores.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Literal
 
 import torch
-import torch.nn.functional as F
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,7 +46,7 @@ SCALE_EXPONENT_BIAS: int = 127
 class TCFPMode(Enum):
     """Available TCFP precision modes."""
 
-    TCFP8 = auto()   # Enhanced block-scaled FP8 (~8.25 bits)
+    TCFP8 = auto()  # Enhanced block-scaled FP8 (~8.25 bits)
     TCFP12 = auto()  # FP8 + 4-bit residual (~12.25 bits)
     TCFP16 = auto()  # Residual FP8 / double FP8 (~16.5 bits)
 
@@ -136,6 +132,61 @@ def to_fp8_e5m2(
     return fp8, inv_scale
 
 
+def to_fp8_e4m3_nf_aware(
+    tensor: torch.Tensor,
+    sigma_factor: float = 3.0,
+    stochastic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cast to FP8 E4M3 with per-tensor NF-aware (sigma-based) scaling.
+
+    Uses ``sigma_factor * std(tensor)`` as the effective max instead of
+    ``abs().max()``, reducing quantisation noise for Gaussian-distributed
+    data at the cost of clipping ~0.3 % of outliers (at 3-sigma).
+
+    Args:
+        tensor: Input tensor (any float dtype).
+        sigma_factor: Number of standard deviations to cover (default 3.0).
+        stochastic: Use stochastic rounding via :func:`stochastic_round_to_fp8_e4m3`.
+
+    Returns:
+        ``(fp8_tensor, inv_scale)`` where ``inv_scale`` has shape ``(1,)``
+        for direct compatibility with ``torch._scaled_mm``.
+    """
+    t = tensor.float()
+    std = t.std().clamp(min=1e-12)
+    # Fall back to amax for near-constant tensors
+    target_max = t.abs().max().clamp(min=1e-12) if std < 1e-6 else sigma_factor * std
+
+    scale = (FP8_E4M3_MAX / target_max).to(torch.float32)
+    scaled = (t * scale).clamp(FP8_E4M3_MIN, FP8_E4M3_MAX)
+
+    fp8 = stochastic_round_to_fp8_e4m3(scaled) if stochastic else scaled.to(torch.float8_e4m3fn)
+
+    inv_scale = torch.ones(1, device=tensor.device, dtype=torch.float32) / scale
+    return fp8, inv_scale
+
+
+def ensure_column_major(t: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure a 2-D tensor is in column-major layout for ``torch._scaled_mm``.
+
+    ``_scaled_mm`` requires its second operand (mat2) to have column-major
+    strides ``(1, K)``.  If the tensor is already column-major this is a
+    no-op; otherwise a contiguous copy is made.
+
+    Args:
+        t: 2-D tensor of shape ``(K, N)``.
+
+    Returns:
+        Column-major view (or copy) of *t*.
+    """
+    assert t.ndim == 2, f"ensure_column_major requires 2-D tensor, got {t.ndim}-D"
+    if t.stride(0) == 1 and t.stride(1) == t.shape[0]:
+        return t
+    return t.t().contiguous().t()
+
+
 # ---------------------------------------------------------------------------
 # Block Scale Computation
 # ---------------------------------------------------------------------------
@@ -173,6 +224,141 @@ def compute_block_scales(
     raw_exp = torch.ceil(torch.log2(amax / fp8_max))
     scales = torch.exp2(raw_exp)
     return scales
+
+
+def compute_nf_aware_scales(
+    tensor: torch.Tensor,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    sigma_factor: float = 3.0,
+) -> torch.Tensor:
+    """
+    Compute block scales optimised for Gaussian-distributed values.
+
+    Instead of scaling to the block maximum (which wastes dynamic range
+    on outliers), we scale to ``sigma_factor * std`` of the block.
+    Values beyond this range are clipped — but for Gaussian data, only
+    ~0.3% of values exceed 3 sigma, and clipping them causes minimal MSE.
+
+    Args:
+        tensor: Input tensor, shape ``(..., D)``.
+        block_size: Block size.
+        sigma_factor: Number of standard deviations to cover (default 3.0).
+
+    Returns:
+        Block scales of shape ``(..., D // block_size)``.
+    """
+    *batch_dims, D = tensor.shape
+    num_blocks = D // block_size
+    blocked = tensor.reshape(*batch_dims, num_blocks, block_size)
+
+    # Per-block standard deviation
+    block_std = blocked.float().std(dim=-1, correction=0).clamp(min=1e-12)
+    block_amax = blocked.float().abs().amax(dim=-1).clamp(min=1e-12)
+    target_max = sigma_factor * block_std
+    # Fall back to amax for near-constant blocks (std ~ 0)
+    target_max = torch.where(block_std < 1e-6, block_amax, target_max)
+
+    # Power-of-2 scale
+    raw_exp = torch.ceil(torch.log2(target_max / FP8_E4M3_MAX))
+    scales = torch.exp2(raw_exp)
+    return scales
+
+
+# ---------------------------------------------------------------------------
+# Error Feedback State
+# ---------------------------------------------------------------------------
+
+
+class ErrorFeedbackState:
+    """
+    Per-parameter error feedback buffers for TCFP quantisation.
+
+    Tracks the quantisation error from each step and adds it back
+    to the next quantisation input, ensuring unbiased long-term rounding.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: dict[str, torch.Tensor] = {}
+        self._amax_ema: dict[str, torch.Tensor] = {}
+        self._ema_decay: float = 0.999
+
+    def get_error(self, name: str, like: torch.Tensor) -> torch.Tensor:
+        if name not in self._buffers or self._buffers[name].shape != like.shape:
+            self._buffers[name] = torch.zeros_like(like)
+        return self._buffers[name]
+
+    def update_error(self, name: str, error: torch.Tensor) -> None:
+        self._buffers[name] = error.detach()
+
+    def get_amax_ema(self, name: str, current_amax: torch.Tensor) -> torch.Tensor:
+        """Get smoothed amax via exponential moving average."""
+        if name not in self._amax_ema:
+            self._amax_ema[name] = current_amax.detach().clone()
+        else:
+            self._amax_ema[name] = (
+                self._ema_decay * self._amax_ema[name]
+                + (1 - self._ema_decay) * current_amax.detach()
+            )
+        return self._amax_ema[name]
+
+    def reset(self) -> None:
+        self._buffers.clear()
+        self._amax_ema.clear()
+
+
+# ---------------------------------------------------------------------------
+# Stochastic Rounding
+# ---------------------------------------------------------------------------
+
+
+def stochastic_round_to_fp8_e4m3(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Cast to FP8 E4M3 with stochastic rounding.
+
+    For each value, computes the floor and ceil FP8 representations,
+    then probabilistically selects between them proportional to proximity.
+    This ensures ``E[dequant(quant(x))] = x`` (unbiased).
+
+    Args:
+        tensor: Tensor already in FP8 E4M3 representable range (clamped).
+
+    Returns:
+        FP8 E4M3 tensor with stochastic rounding applied.
+    """
+    # Floor cast: truncate toward zero
+    lo = tensor.to(torch.float8_e4m3fn)
+    lo_f = lo.float()
+
+    # Compute the gap to the next representable FP8 value
+    # Use the magnitude-based ULP: for E4M3, ULP = 2^(exponent - 3)
+    # Simpler approach: cast (tensor + epsilon) to find the next value
+    eps_direction = torch.sign(tensor - lo_f)
+    # For values exactly on an FP8 grid point, no rounding needed
+    exact_mask = tensor == lo_f
+
+    # Compute next FP8 value in the direction of the residual
+    # Add a small nudge in the residual direction, then cast
+    nudge = eps_direction * FP8_E4M3_SMALLEST_NORMAL * 0.5
+    hi = (lo_f + nudge).to(torch.float8_e4m3fn)
+    # If hi == lo (at boundaries), try a larger nudge
+    same_mask = (hi.float() == lo_f) & ~exact_mask
+    if same_mask.any():
+        abs_lo = lo_f.abs().clamp(min=FP8_E4M3_SMALLEST_NORMAL)
+        # ULP is approximately value * 2^(-mantissa_bits) = value * 0.125
+        larger_nudge = eps_direction * abs_lo * 0.25
+        hi_retry = (lo_f + larger_nudge).to(torch.float8_e4m3fn)
+        hi = torch.where(same_mask, hi_retry, hi)
+
+    hi_f = hi.float()
+
+    # Probability of rounding up = (value - lo) / (hi - lo)
+    gap = (hi_f - lo_f).abs().clamp(min=1e-45)
+    frac = ((tensor - lo_f).abs() / gap).clamp(0.0, 1.0)
+
+    # Stochastic selection
+    rand = torch.rand_like(frac)
+    result = torch.where(exact_mask, lo, torch.where(rand < frac, hi, lo))
+    return result
 
 
 def apply_block_scales(

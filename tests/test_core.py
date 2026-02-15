@@ -6,9 +6,7 @@ import pytest
 import torch
 
 from tcfp.core import (
-    DEFAULT_BLOCK_SIZE,
     FP8_E4M3_MAX,
-    FP8_E5M2_MAX,
     FP8Config,
     TCFPMode,
     apply_block_scales,
@@ -21,9 +19,7 @@ from tcfp.core import (
 )
 
 # All tests require CUDA
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 DEVICE = "cuda"
 

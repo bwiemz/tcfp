@@ -13,18 +13,24 @@ Three modes, all using FP8 tensor cores:
 from __future__ import annotations
 
 from tcfp.core import (
+    ErrorFeedbackState,
     FP8Config,
     TCFPMode,
+    ensure_column_major,
     fp8_matmul,
     to_fp8_e4m3,
+    to_fp8_e4m3_nf_aware,
     to_fp8_e5m2,
 )
 
 __all__ = [
+    "ErrorFeedbackState",
     "FP8Config",
     "TCFPMode",
+    "ensure_column_major",
     "fp8_matmul",
     "to_fp8_e4m3",
+    "to_fp8_e4m3_nf_aware",
     "to_fp8_e5m2",
 ]
 
