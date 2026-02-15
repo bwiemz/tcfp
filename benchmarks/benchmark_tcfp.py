@@ -28,6 +28,15 @@ from tcfp.kernels import (
     is_triton_available,
 )
 from tcfp.nn import convert_to_tcfp
+
+try:
+    from tcfp.cuda_ext import (
+        cuda_ext_dual_gemm_forward,
+        is_cuda_ext_available,
+    )
+    _HAS_CUDA_EXT = is_cuda_ext_available()
+except ImportError:
+    _HAS_CUDA_EXT = False
 from tcfp.tcfp12 import fake_quantize_tcfp12
 from tcfp.tcfp16 import (
     fake_quantize_tcfp16,
@@ -379,6 +388,93 @@ def benchmark_block_scaled_gemm() -> None:
         )
 
 
+# ── Benchmark 3d: Dual-GEMM Dispatch Variants ──────────────────────────
+
+
+def benchmark_dual_gemm_variants() -> None:
+    """Compare all dual-GEMM dispatch paths: naive, Triton, cuBLASLt."""
+    print("\n" + "=" * 70)
+    print("  BENCHMARK 3d: Dual-GEMM Dispatch Variants (ms per call)")
+    print("=" * 70)
+
+    shapes = [
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+    ]
+
+    has_triton = is_triton_available()
+    if has_triton:
+        from tcfp.kernels import fused_dual_gemm_forward as triton_fwd
+
+    cols = ["BF16 mm", "Naive 2x"]
+    if has_triton:
+        cols.append("Triton")
+    if _HAS_CUDA_EXT:
+        cols.append("cuBLASLt")
+
+    header = f"  {'(M,K,N)':<24} " + " ".join(f"{c:<12}" for c in cols)
+    print(f"\n{header}")
+    print(f"  {'-' * 24} " + " ".join(f"{'-' * 12}" for _ in cols))
+
+    for M, K, N in shapes:
+        x = torch.randn(M, K, device=DEVICE)
+        w = torch.randn(N, K, device=DEVICE)
+
+        # BF16 baseline
+        x_bf = x.bfloat16()
+        w_bf = w.bfloat16()
+        t_bf16 = time_fn(lambda: x_bf @ w_bf.t())
+
+        # Prepare FP8 data
+        x_fp8, x_inv = to_fp8_e4m3(x)
+        w_hi_fp8, w_hi_inv = to_fp8_e4m3(w)
+        residual = w - w_hi_fp8.float() * w_hi_inv
+        w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
+
+        w_hi_t = w_hi_fp8.t()
+        w_lo_t = w_lo_fp8.t()
+
+        # Naive: 2x _scaled_mm + add
+        def naive_fn() -> None:
+            hi = torch._scaled_mm(  # pyright: ignore[reportPrivateUsage]
+                x_fp8, w_hi_t,
+                scale_a=x_inv, scale_b=w_hi_inv,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+            lo = torch._scaled_mm(  # pyright: ignore[reportPrivateUsage]
+                x_fp8, w_lo_t,
+                scale_a=x_inv, scale_b=w_lo_inv,
+                out_dtype=torch.float32, use_fast_accum=False,
+            )
+            _ = hi + lo
+
+        t_naive = time_fn(naive_fn)
+
+        vals = [f"{t_bf16:<12.3f}", f"{t_naive:<12.3f}"]
+
+        if has_triton:
+            t_triton = time_fn(
+                lambda: triton_fwd(  # pyright: ignore[reportPossiblyUnboundVariable]
+                    x_fp8, w_hi_fp8, w_lo_fp8,
+                    x_inv, w_hi_inv, w_lo_inv,
+                )
+            )
+            vals.append(f"{t_triton:<12.3f}")
+
+        if _HAS_CUDA_EXT:
+            t_cuda = time_fn(
+                lambda: cuda_ext_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                    x_fp8, w_hi_fp8, w_lo_fp8,
+                    x_inv, w_hi_inv, w_lo_inv,
+                )
+            )
+            vals.append(f"{t_cuda:<12.3f}")
+
+        print(f"  {str((M, K, N)):<24} " + " ".join(vals))
+
+
 # ── Benchmark 4: Training Step (Mini MLP) ───────────────────────────────
 
 
@@ -414,6 +510,10 @@ def benchmark_training_step() -> None:
         }),
         ("TCFP-12 TC+Fused", TCFPMode.TCFP12, {
             "use_tensor_cores": True, "use_fused_kernel": True,
+        }),
+        ("TCFP-12 TC+CUDA", TCFPMode.TCFP12, {
+            "use_tensor_cores": True, "use_cuda_ext": True,
+            "use_fused_kernel": False,
         }),
         ("TCFP-12-Enh", TCFPMode.TCFP12, {"nf4_residual": True, "nf_aware_scaling": True}),
         ("TCFP-12 TC+B32", TCFPMode.TCFP12, {
@@ -496,6 +596,7 @@ def main() -> None:
     benchmark_matmul_throughput()
     benchmark_tensor_core_gemm()
     benchmark_block_scaled_gemm()
+    benchmark_dual_gemm_variants()
     benchmark_training_step()
     benchmark_vram()
 

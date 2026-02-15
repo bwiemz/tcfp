@@ -157,7 +157,7 @@ NVIDIA TE is the current industry standard for FP8 training:
 
 TCFP-12 TC is a research prototype. To become a viable replacement for the current standard:
 
-1. **Fused CUDA kernels** — Currently two separate `torch._scaled_mm` dispatches per layer. A fused kernel that runs both GEMMs back-to-back (sharing activation reads in shared memory) could halve memory bandwidth and approach the theoretical 2x FP8 FLOPS advantage. This is the single most impactful optimization.
+1. **Fused CUDA kernels** — *(Partially done)* The cuBLASLt C++ extension fuses the two forward GEMMs via beta=1 accumulation, eliminating the intermediate FP32 buffer and addition kernel. The backward pass still uses two separate dispatches because cuBLASLt doesn't support E5M2 as A-type on SM 12.0+ (Blackwell). A fully fused kernel (forward + backward) sharing activation reads in shared memory could further halve memory bandwidth.
 
 2. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Native CUDA kernels or compiler-level fusion could close this gap. Per-block scaling provides better dynamic range for outlier-heavy distributions common in real LLMs.
 
@@ -203,14 +203,25 @@ convert_to_tcfp(model, mode=TCFPMode.TCFP12,
                 use_tensor_cores=True, error_feedback=True)  # default
 ```
 
-### Fused Dual-GEMM Kernel
+### Fused Dual-GEMM Kernels
 
-Single Triton kernel that reads the activation matrix once and computes both W_hi and W_lo GEMMs, reducing memory bandwidth:
+Two fusion approaches for the 2-GEMM residual architecture, with automatic 3-tier dispatch:
+
+**cuBLASLt C++ Extension** (highest priority) — JIT-compiled native CUDA extension using cuBLASLt's beta=1 accumulation. The second GEMM accumulates directly onto the first result, eliminating the intermediate FP32 buffer and addition kernel. Forward-only (cuBLASLt doesn't support E5M2 gradients as A-type on SM 12.0+):
+
+```python
+convert_to_tcfp(model, mode=TCFPMode.TCFP12,
+                use_tensor_cores=True, use_cuda_ext=True)  # default
+```
+
+**Triton Fused Kernel** — Single Triton kernel that reads the activation matrix once and computes both GEMMs, reducing memory bandwidth. Supports both forward and backward:
 
 ```python
 convert_to_tcfp(model, mode=TCFPMode.TCFP12,
                 use_tensor_cores=True, use_fused_kernel=True)
 ```
+
+Dispatch priority: cuBLASLt C++ ext > Triton fused > 2x `torch._scaled_mm` + add.
 
 ## How Each Mode Works
 
@@ -234,7 +245,8 @@ Requires:
 - Python >= 3.10
 - PyTorch >= 2.4.0 with CUDA (FP8 tensor core support)
 - GPU with FP8 support (Hopper H100, Ada RTX 4090, Blackwell RTX 5070+)
-- Optional: Triton (for fused kernels and per-block scaling)
+- Optional: Triton (for Triton fused kernels and per-block scaling)
+- Optional: CUDA Toolkit + C++ compiler (for cuBLASLt fused dual-GEMM extension)
 
 ## Quick Start
 
@@ -291,12 +303,13 @@ x_recovered = dequantize_tcfp16(tcfp16)
 - 22% less VRAM than BF16 for weight storage
 - PDDS eliminates W_lo amax computation with zero quality loss
 - Per-block Triton kernels provide fine-grained dynamic range
+- cuBLASLt C++ extension fuses forward GEMMs via beta=1 accumulation (no intermediate buffer)
 
 **Current limitations:**
 - **1.8x slower than BF16** in training step throughput (unfused 2-GEMM overhead)
 - **Per-tensor scaling only** on the `_scaled_mm` path (Triton block-scaled path adds ~40% overhead)
 - **Single-GPU only**: Not validated with distributed training strategies (FSDP, TP, PP)
-- **No fused CUDA kernels**: The 2-GEMM path dispatches two separate `_scaled_mm` calls
+- **Partial kernel fusion**: cuBLASLt fuses forward GEMMs but backward still dispatches separately (E5M2 limitation)
 - **Research prototype**: Not battle-tested at production scale
 
 ## Project Structure
@@ -308,14 +321,17 @@ tcfp/
 │                          error feedback with PDDS delayed scaling
 │   ├── kernels.py       # Triton kernels: fused dual-GEMM, block-scaled GEMM,
 │                          block quantization
+│   ├── cuda_ext.py      # cuBLASLt C++ extension JIT loader + Python wrapper
+│   ├── csrc/            # C++ source: fused dual FP8 GEMM via cuBLASLt
+│   │                      beta=1 accumulation (fused_dual_gemm.h/.cu/_bind.cpp)
 │   ├── tcfp12/          # FP8 + 4-bit residual (fake-quantize path)
 │   ├── tcfp16/          # Residual FP8 (double FP8)
 │   └── nn/              # Drop-in modules (TCFPLinear, TCFPLayerNorm, etc.)
 │                          _TCFP12TensorCoreFunction (2-GEMM residual),
 │                          _TCFP12BlockScaledFunction (per-block),
 │                          and PDDS delayed scaling helpers
-├── tests/               # 220 tests covering all modes + tensor core paths
-│                          + delayed scaling + block scaling
+├── tests/               # 237 tests covering all modes + tensor core paths
+│                          + delayed scaling + block scaling + cuBLASLt ext
 ├── benchmarks/          # Quality + throughput + TC GEMM + block GEMM benchmarks
 ├── examples/            # Training convergence tests (MNIST + TinyGPT)
 └── pyproject.toml

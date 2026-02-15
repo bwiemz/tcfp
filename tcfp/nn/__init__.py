@@ -49,6 +49,17 @@ try:
 except ImportError:
     _HAS_FUSED_KERNELS = False
 
+# cuBLASLt C++ extension (optional — requires CUDA Toolkit)
+try:
+    from tcfp.cuda_ext import (
+        cuda_ext_dual_gemm_forward,
+        is_cuda_ext_available,
+    )
+
+    _HAS_CUDA_EXT = is_cuda_ext_available()
+except ImportError:
+    _HAS_CUDA_EXT = False
+
 # ---------------------------------------------------------------------------
 # Autograd: STE Fake-Quantize
 # ---------------------------------------------------------------------------
@@ -321,6 +332,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         param_name: str,
         delayed_scaling: bool = False,
         use_fused_kernel: bool = True,
+        use_cuda_ext: bool = True,
     ) -> torch.Tensor:
         # --- 1. Error feedback on weight ---
         w = weight.float()
@@ -367,7 +379,13 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         act_fp8, act_inv = to_fp8_e4m3(input_2d)  # always fresh
 
         # --- 6. Two FP8 GEMMs: output = (act @ W_hi.T) + (act @ W_lo.T) ---
-        if _HAS_FUSED_KERNELS and use_fused_kernel:
+        # 3-tier dispatch: cuBLASLt C++ ext > Triton fused > 2x _scaled_mm
+        if _HAS_CUDA_EXT and use_cuda_ext:
+            output_2d = cuda_ext_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                act_fp8, w_hi_fp8, w_lo_fp8,
+                act_inv, w_hi_inv, w_lo_inv,
+            )
+        elif _HAS_FUSED_KERNELS and use_fused_kernel:
             output_2d = fused_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
                 act_fp8, w_hi_fp8, w_lo_fp8,
                 act_inv, w_hi_inv, w_lo_inv,
@@ -427,7 +445,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
-        None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None,
     ]:
         saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
         saved_act = saved[0]
@@ -449,6 +467,9 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)
 
         # --- 3. dX = grad @ W_hi + grad @ W_lo (2 GEMMs) ---
+        # Note: cuBLASLt doesn't support E5M2 as A-type on SM 12.0+
+        # (backward gradients are E5M2), so we skip cuBLASLt here and
+        # dispatch to Triton fused kernel or 2x _scaled_mm fallback.
         if _HAS_FUSED_KERNELS and use_fused:
             grad_input = fused_dual_gemm_backward_dx(  # pyright: ignore[reportPossiblyUnboundVariable]
                 grad_fp8, w_hi_fp8, w_lo_fp8,
@@ -500,7 +521,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             grad_input,
             grad_weight,
             grad_bias,
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -682,6 +703,8 @@ class TCFPLinear(nn.Module):
             (TCFP-12 tensor core path only).
         use_fused_kernel: Use fused Triton 2-GEMM kernel when available
             (TCFP-12 tensor core path only, requires Triton).
+        use_cuda_ext: Use cuBLASLt C++ extension for fused dual GEMM
+            (TCFP-12 tensor core path only, requires CUDA Toolkit).
         scale_block_size: Per-block scaling block size (32, 64, or 128).
             ``None`` (default) uses per-tensor scaling. Requires Triton
             and ``use_tensor_cores=True``. Mutually exclusive with
@@ -706,6 +729,7 @@ class TCFPLinear(nn.Module):
         error_feedback: bool = True,
         delayed_scaling: bool = False,
         use_fused_kernel: bool = True,
+        use_cuda_ext: bool = True,
         scale_block_size: int | None = None,
     ) -> None:
         super().__init__()
@@ -744,6 +768,13 @@ class TCFPLinear(nn.Module):
             warnings.warn(
                 "use_fused_kernel=True requested but Triton is not available. "
                 "Falling back to two separate _scaled_mm calls.",
+                stacklevel=2,
+            )
+        self.use_cuda_ext = use_cuda_ext and _HAS_CUDA_EXT
+        if use_cuda_ext and not _HAS_CUDA_EXT:
+            warnings.warn(
+                "use_cuda_ext=True requested but cuBLASLt C++ extension is "
+                "not available. Install CUDA Toolkit and set CUDA_HOME.",
                 stacklevel=2,
             )
         # Per-block scaling validation
@@ -840,6 +871,7 @@ class TCFPLinear(nn.Module):
                     self._param_name,
                     self.delayed_scaling,
                     self.use_fused_kernel,
+                    self.use_cuda_ext,
                 )
             return result
 
@@ -879,6 +911,8 @@ class TCFPLinear(nn.Module):
             parts.append("delayed_scaling=True")
         if self.use_fused_kernel:
             parts.append("use_fused_kernel=True")
+        if self.use_cuda_ext:
+            parts.append("use_cuda_ext=True")
         if self.scale_block_size is not None:
             parts.append(f"scale_block_size={self.scale_block_size}")
         if self._warmup_steps > 0:
@@ -1011,6 +1045,7 @@ def convert_to_tcfp(
     error_feedback: bool = True,
     delayed_scaling: bool = False,
     use_fused_kernel: bool = True,
+    use_cuda_ext: bool = True,
     scale_block_size: int | None = None,
     _parent_path: str = "",
 ) -> nn.Module:
@@ -1038,6 +1073,8 @@ def convert_to_tcfp(
             (TCFP-12 tensor core path only).
         use_fused_kernel: Use fused Triton 2-GEMM kernel when available
             (TCFP-12 tensor core path only, requires Triton).
+        use_cuda_ext: Use cuBLASLt C++ extension for fused dual GEMM
+            (TCFP-12 tensor core path only, requires CUDA Toolkit).
         scale_block_size: Per-block scaling block size (32, 64, or 128).
             ``None`` uses per-tensor scaling. Requires Triton.
 
@@ -1062,6 +1099,7 @@ def convert_to_tcfp(
             error_feedback=error_feedback,
             delayed_scaling=delayed_scaling,
             use_fused_kernel=use_fused_kernel,
+            use_cuda_ext=use_cuda_ext,
             scale_block_size=scale_block_size,
             _parent_path=full_path,
         )
@@ -1101,6 +1139,7 @@ def convert_to_tcfp(
                 error_feedback=error_feedback,
                 delayed_scaling=delayed_scaling and layer_tc,
                 use_fused_kernel=use_fused_kernel and layer_tc,
+                use_cuda_ext=use_cuda_ext and layer_tc,
                 scale_block_size=layer_sbs if layer_tc else None,
             )
             new_module._param_name = full_path
