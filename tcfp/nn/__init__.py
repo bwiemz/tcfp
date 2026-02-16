@@ -37,6 +37,7 @@ try:
     from tcfp.kernels import (
         block_dequantize_fp8,
         block_quantize_fp8,
+        fused_act_quant_dual_gemm_forward,
         fused_block_scaled_dual_gemm_backward_dx,
         fused_block_scaled_dual_gemm_forward,
         fused_dual_gemm_backward_dx,
@@ -566,21 +567,35 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         # buffer, so no explicit update_error() call needed.
         # (new_error = weight - dequant(W_hi) - dequant(W_lo))
 
-        # --- 5. Flatten input to 2D, block-quantise activation ---
+        # --- 5. Flatten input to 2D ---
         input_shape = input.shape
         input_2d = (
             input.reshape(-1, input.shape[-1]) if input.ndim == 3 else input
         )
-        act_fp8, act_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
-            input_2d, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
-        )
 
-        # --- 6. Fused block-scaled dual GEMM ---
-        output_2d = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
-            act_fp8, w_hi_fp8, w_lo_fp8,
-            act_scales, w_hi_scales, w_lo_scales,
-            block_size=scale_block_size,
-        )
+        # --- 6. Act quantize + block-scaled dual GEMM ---
+        # Dispatch: fused path (quant-in-GEMM) for small/medium N,
+        # separate path for large N where FP8 L2 reuse wins.
+        N = weight.shape[0]
+        num_n_tiles = (N + 127) // 128  # approx (BLOCK_N varies)
+        use_fused_act = num_n_tiles <= 4
+
+        if use_fused_act:
+            output_2d, act_fp8, act_scales = fused_act_quant_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                input_2d, w_hi_fp8, w_lo_fp8,
+                w_hi_scales, w_lo_scales,
+                block_size=scale_block_size,
+            )
+        else:
+            act_fp8, act_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+                input_2d, block_size=scale_block_size,
+                fp8_dtype=torch.float8_e4m3fn,
+            )
+            output_2d = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                act_fp8, w_hi_fp8, w_lo_fp8,
+                act_scales, w_hi_scales, w_lo_scales,
+                block_size=scale_block_size,
+            )
 
         # --- 7. Add bias and reshape ---
         if bias is not None:

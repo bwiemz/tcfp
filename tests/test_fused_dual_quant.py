@@ -175,7 +175,7 @@ class TestOutputFormat:
         N, K = 128, 256
         w = torch.randn(N, K, device=DEVICE)
         _, _, sh, sl = fused_dual_quantize_fp8(w, block_size=block_size)  # type: ignore[reportPossiblyUnboundVariable]
-        expected = (N, K // block_size)
+        expected = (K // block_size, N)
         assert sh.shape == expected
         assert sl.shape == expected
 
@@ -355,7 +355,7 @@ class TestEdgeCases:
         w = torch.randn(N, K, device=DEVICE)
         w_hi, w_lo, sh, sl = fused_dual_quantize_fp8(w, block_size=block_size)  # type: ignore[reportPossiblyUnboundVariable]
         assert w_hi.shape == (N, K)
-        assert sh.shape == (N, K // block_size)
+        assert sh.shape == (K // block_size, N)
 
 
 # ── Integration Tests ────────────────────────────────────────────────────

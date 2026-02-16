@@ -374,19 +374,25 @@ try:
         # ── 5. Quantize W_lo — same power-of-2 scaling ──
         amax_lo = tl.max(tl.abs(residual), axis=1)  # (BLOCK_N,)
 
-        # Zero-residual fast path: set inv_scale=1.0 BEFORE quantization
-        # so FP8 values and stored scales are consistent (0/1=0 → 0*1=0).
+        # Zero-residual detection: use 1.0 for safe division, store 0.0 as
+        # unambiguous sparsity sentinel (1.0 is ambiguous — amax in [224,448]
+        # also produces inv_scale=1.0).
         zero_residual = amax_lo < 1e-12
         amax_lo_safe = tl.maximum(amax_lo, 1e-12)  # safe for log2
 
         raw_exp_lo = tl.ceil(tl.log2(amax_lo_safe / FP8_MAX))
         raw_exp_lo = tl.maximum(raw_exp_lo, -126.0)
         inv_scale_lo = tl.exp2(raw_exp_lo)
-        inv_scale_lo = tl.where(zero_residual, 1.0, inv_scale_lo)
+        # Keep 1.0 for division to avoid 0/0
+        safe_inv_scale_lo = tl.where(zero_residual, 1.0, inv_scale_lo)
 
-        w_lo_scaled = residual / inv_scale_lo[:, None]
+        w_lo_scaled = residual / safe_inv_scale_lo[:, None]
         w_lo_clamped = tl.maximum(tl.minimum(w_lo_scaled, FP8_MAX), -FP8_MAX)
         w_lo_fp8 = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
+
+        # Store 0.0 sentinel for zero residuals — GEMM kernels can skip
+        # W_lo tile loads when scale==0.0
+        inv_scale_lo = tl.where(zero_residual, 0.0, inv_scale_lo)
 
         # NOTE: Error update is computed outside the kernel using the stored
         # FP8 values.  In-kernel dequant can differ from stored-value dequant
@@ -632,8 +638,19 @@ try:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
+        SPARSE_THRESHOLD: tl.constexpr,
+        num_sms_launch,
     ):
         """Fused dual-GEMM with per-block scales and shared input.
+
+        Uses persistent tiling: each CTA loops over multiple output tiles
+        (stride ``num_programs``) to eliminate wave quantization.  When the
+        grid equals ``num_tiles``, each CTA processes exactly one tile
+        (identical to non-persistent behaviour).
+
+        When ``SPARSE_THRESHOLD >= 0``, K-blocks where
+        ``max(sblo) <= SPARSE_THRESHOLD`` skip the W_lo tile load and
+        dot product entirely (the residual contribution is zero).
 
         Computes::
 
@@ -645,85 +662,342 @@ try:
         A tiles are loaded **once** per K-iteration (bandwidth saving).
         ``sa`` is factored out of both terms (saves one multiply).
         """
-        # ── Program-ID mapping with grouping for L2 reuse ──
-        pid = tl.program_id(0)
+        # ── Persistent tile loop setup ──
+        start_pid = tl.program_id(0)
         num_m = tl.cdiv(M, BLOCK_M)
         num_n = tl.cdiv(N, BLOCK_N)
-        num_in_group = GROUP_M * num_n
-        group_id = pid // num_in_group
-        first_m = group_id * GROUP_M
-        group_m = min(num_m - first_m, GROUP_M)
-        pid_m = first_m + ((pid % num_in_group) % group_m)
-        pid_n = (pid % num_in_group) // group_m
+        num_tiles = num_m * num_n
+        num_programs = min(num_sms_launch, num_tiles)
 
-        # ── Offset setup ──
-        offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-        offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-        offs_k = tl.arange(0, BLOCK_K)
+        tile_id = start_pid
+        while tile_id < num_tiles:
+            # ── GROUP_M tile mapping for L2 reuse ──
+            num_in_group = GROUP_M * num_n
+            group_id = tile_id // num_in_group
+            first_m = group_id * GROUP_M
+            group_m = min(num_m - first_m, GROUP_M)
+            pid_m = first_m + ((tile_id % num_in_group) % group_m)
+            pid_n = (tile_id % num_in_group) // group_m
 
-        a_ptrs = (
-            a_ptr
-            + offs_m[:, None] * stride_am
-            + offs_k[None, :] * stride_ak
-        )
-        bh_ptrs = (
-            b_hi_ptr
-            + offs_k[:, None] * stride_bk_hi
-            + offs_n[None, :] * stride_bn_hi
-        )
-        bl_ptrs = (
-            b_lo_ptr
-            + offs_k[:, None] * stride_bk_lo
-            + offs_n[None, :] * stride_bn_lo
-        )
+            # ── Tile-dependent offsets (recomputed per tile) ──
+            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+            offs_k = tl.arange(0, BLOCK_K)
 
-        # ── FP32 accumulator ──
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            a_ptrs = (
+                a_ptr
+                + offs_m[:, None] * stride_am
+                + offs_k[None, :] * stride_ak
+            )
+            bh_ptrs = (
+                b_hi_ptr
+                + offs_k[:, None] * stride_bk_hi
+                + offs_n[None, :] * stride_bn_hi
+            )
+            bl_ptrs = (
+                b_lo_ptr
+                + offs_k[:, None] * stride_bk_lo
+                + offs_n[None, :] * stride_bn_lo
+            )
 
-        # ── K-dimension loop (one scale block per iteration) ──
-        for kb in range(0, num_k_blocks):
-            k_mask = offs_k < (K - kb * BLOCK_K)
+            # ── FP32 accumulator (re-initialised per tile) ──
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-            # Load A tile ONCE (bandwidth saving)
-            a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-            # Load both B tiles
-            bh = tl.load(bh_ptrs, mask=k_mask[:, None], other=0.0)
-            bl = tl.load(bl_ptrs, mask=k_mask[:, None], other=0.0)
+            # ── K-dimension loop (one scale block per iteration) ──
+            for kb in range(0, num_k_blocks):
+                k_mask = offs_k < (K - kb * BLOCK_K)
 
-            # Two FP8 dot products -> FP32
-            partial_hi = tl.dot(a, bh, max_num_imprecise_acc=0)
-            partial_lo = tl.dot(a, bl, max_num_imprecise_acc=0)
+                # Load A tile ONCE (bandwidth saving)
+                a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+                bh = tl.load(bh_ptrs, mask=k_mask[:, None], other=0.0)
 
-            # Load per-block scales
-            sa = tl.load(
-                scales_a_ptr + offs_m * stride_sa_m + kb * stride_sa_kb
-            )  # (BLOCK_M,)
-            sbhi = tl.load(
-                scales_bhi_ptr + offs_n * stride_sbhi_n + kb * stride_sbhi_kb
-            )  # (BLOCK_N,)
-            sblo = tl.load(
-                scales_blo_ptr + offs_n * stride_sblo_n + kb * stride_sblo_kb
-            )  # (BLOCK_N,)
+                partial_hi = tl.dot(a, bh, max_num_imprecise_acc=0)
 
-            # Factor sa out: acc += (hi*sbhi + lo*sblo) * sa
-            combined = partial_hi * sbhi[None, :] + partial_lo * sblo[None, :]
-            acc += combined * sa[:, None]
+                # Load per-block scales
+                sa = tl.load(
+                    scales_a_ptr + offs_m * stride_sa_m + kb * stride_sa_kb
+                )  # (BLOCK_M,)
+                sbhi = tl.load(
+                    scales_bhi_ptr
+                    + offs_n * stride_sbhi_n
+                    + kb * stride_sbhi_kb
+                )  # (BLOCK_N,)
+                sblo = tl.load(
+                    scales_blo_ptr
+                    + offs_n * stride_sblo_n
+                    + kb * stride_sblo_kb
+                )  # (BLOCK_N,)
 
-            # Advance K pointers
-            a_ptrs += BLOCK_K * stride_ak
-            bh_ptrs += BLOCK_K * stride_bk_hi
-            bl_ptrs += BLOCK_K * stride_bk_lo
+                # Sparsity fast-path: skip W_lo when all scales <= threshold
+                is_sparse = tl.max(sblo) <= SPARSE_THRESHOLD
+                if is_sparse:
+                    combined = partial_hi * sbhi[None, :]
+                else:
+                    bl = tl.load(bl_ptrs, mask=k_mask[:, None], other=0.0)
+                    partial_lo = tl.dot(a, bl, max_num_imprecise_acc=0)
+                    combined = (
+                        partial_hi * sbhi[None, :]
+                        + partial_lo * sblo[None, :]
+                    )
 
-        # ── Store output (masked for partial tiles) ──
-        offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        out_ptrs = (
-            out_ptr
-            + offs_om[:, None] * stride_om
-            + offs_on[None, :] * stride_on
-        )
-        out_mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
-        tl.store(out_ptrs, acc, mask=out_mask)
+                acc += combined * sa[:, None]
+
+                # Advance K pointers
+                a_ptrs += BLOCK_K * stride_ak
+                bh_ptrs += BLOCK_K * stride_bk_hi
+                bl_ptrs += BLOCK_K * stride_bk_lo
+
+            # ── Store output (masked for partial tiles) ──
+            offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            out_ptrs = (
+                out_ptr
+                + offs_om[:, None] * stride_om
+                + offs_on[None, :] * stride_on
+            )
+            out_mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+            tl.store(out_ptrs, acc, mask=out_mask)
+
+            tile_id += num_programs
+
+    # ── Fused act-quant + block-scaled dual GEMM configs ──────────────────
+    # BF16 input doubles A-tile SMEM vs FP8-input kernel.  With BLOCK_K=128:
+    # per-stage = A(BM×128×2B) + Bhi(128×BN×1B) + Blo(128×BN×1B).
+    # Hardware SMEM limit ~99 KB → max 2 pipeline stages for these tile
+    # sizes.  Still competitive: GEMM is memory-bound, not pipeline-bound.
+    _FUSED_ACT_QUANT_DUAL_GEMM_CONFIGS = [
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=8,
+        ),
+    ]
+
+    @triton.autotune(
+        configs=_FUSED_ACT_QUANT_DUAL_GEMM_CONFIGS,
+        key=["M", "N", "K", "BLOCK_K"],
+    )
+    @triton.jit
+    def _fused_act_quant_dual_gemm_kernel(
+        # Input pointers
+        a_ptr,          # (M, K) BF16/FP32 activation
+        b_hi_ptr,       # (N, K) FP8 E4M3 weight (read via transposed strides)
+        b_lo_ptr,       # (N, K) FP8 E4M3 residual weight
+        out_ptr,        # (M, N) FP32 output
+        # Side-output pointers (for backward)
+        act_fp8_ptr,    # (M, K) FP8 E4M3 quantized activation
+        act_scales_ptr, # (M, num_kb) FP32 per-block activation scales
+        # Weight scale pointers
+        scales_bhi_ptr, # (N, num_kb) FP32
+        scales_blo_ptr, # (N, num_kb) FP32
+        # Dimensions
+        M,
+        N,
+        K,
+        num_k_blocks,
+        # A strides (BF16/FP32 input)
+        stride_am,
+        stride_ak,
+        # B_hi strides (transposed: stride_bk, stride_bn)
+        stride_bk_hi,
+        stride_bn_hi,
+        # B_lo strides
+        stride_bk_lo,
+        stride_bn_lo,
+        # Output strides
+        stride_om,
+        stride_on,
+        # Side-output act_fp8 strides
+        stride_afm,
+        stride_afk,
+        # Side-output act_scales strides
+        stride_as_m,
+        stride_as_kb,
+        # Scale_bhi strides
+        stride_sbhi_n,
+        stride_sbhi_kb,
+        # Scale_blo strides
+        stride_sblo_n,
+        stride_sblo_kb,
+        # Constants
+        FP8_MAX: tl.constexpr,
+        # Meta-parameters
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        SPARSE_THRESHOLD: tl.constexpr,
+        num_sms_launch,
+    ):
+        """Fused activation quantization + dual-GEMM with per-block scales.
+
+        Like :func:`_fused_block_scaled_dual_gemm_kernel` but takes BF16/FP32
+        activation instead of pre-quantized FP8.  Quantizes each activation
+        tile to FP8 in registers using power-of-2 scaling, then performs
+        two FP8 dot products.
+
+        Uses persistent tiling: each CTA loops over multiple output tiles
+        (stride ``num_programs``) to eliminate wave quantization.
+
+        Side outputs: writes quantized activation and per-block scales for
+        backward (only from ``pid_n == 0`` CTAs to avoid write-back races).
+
+        Computes::
+
+            out[m,n] = sum_{kb} inv_scale_a[m,kb] * (
+                sbhi[n,kb] * dot(quant(A_kb), Bhi_kb)
+              + sblo[n,kb] * dot(quant(A_kb), Blo_kb)
+            )
+        """
+        # ── Persistent tile loop setup ──
+        start_pid = tl.program_id(0)
+        num_m = tl.cdiv(M, BLOCK_M)
+        num_n = tl.cdiv(N, BLOCK_N)
+        num_tiles = num_m * num_n
+        num_programs = min(num_sms_launch, num_tiles)
+
+        tile_id = start_pid
+        while tile_id < num_tiles:
+            # ── GROUP_M tile mapping for L2 reuse ──
+            num_in_group = GROUP_M * num_n
+            group_id = tile_id // num_in_group
+            first_m = group_id * GROUP_M
+            group_m = min(num_m - first_m, GROUP_M)
+            pid_m = first_m + ((tile_id % num_in_group) % group_m)
+            pid_n = (tile_id % num_in_group) // group_m
+
+            # ── Tile-dependent offsets (recomputed per tile) ──
+            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+            offs_k = tl.arange(0, BLOCK_K)
+
+            # Raw offsets (not wrapped) for masking and side-output writes
+            offs_m_raw = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+            a_ptrs = (
+                a_ptr
+                + offs_m[:, None] * stride_am
+                + offs_k[None, :] * stride_ak
+            )
+            bh_ptrs = (
+                b_hi_ptr
+                + offs_k[:, None] * stride_bk_hi
+                + offs_n[None, :] * stride_bn_hi
+            )
+            bl_ptrs = (
+                b_lo_ptr
+                + offs_k[:, None] * stride_bk_lo
+                + offs_n[None, :] * stride_bn_lo
+            )
+
+            # Side-output pointers (advance per K-block in loop)
+            af_ptrs = (
+                act_fp8_ptr
+                + offs_m_raw[:, None] * stride_afm
+                + offs_k[None, :] * stride_afk
+            )
+
+            # ── FP32 accumulator (re-initialised per tile) ──
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            m_mask = offs_m_raw < M
+
+            # ── K-dimension loop (one scale block per iteration) ──
+            for kb in range(0, num_k_blocks):
+                k_mask = offs_k < (K - kb * BLOCK_K)
+
+                # 1. Load BF16/FP32 activation tile -> FP32
+                a_f32 = tl.load(
+                    a_ptrs, mask=k_mask[None, :], other=0.0
+                ).to(tl.float32)
+
+                # 2. Per-row power-of-2 quantization
+                amax = tl.max(tl.abs(a_f32), axis=1)  # (BLOCK_M,)
+                amax = tl.maximum(amax, 1e-12)
+                raw_exp = tl.ceil(tl.log2(amax / FP8_MAX))
+                raw_exp = tl.maximum(raw_exp, -126.0)
+                inv_scale_a = tl.exp2(raw_exp)  # (BLOCK_M,)
+
+                a_scaled = a_f32 / inv_scale_a[:, None]
+                a_clamped = tl.maximum(
+                    tl.minimum(a_scaled, FP8_MAX), -FP8_MAX
+                )
+                a_fp8 = a_clamped.to(b_hi_ptr.dtype.element_ty)
+
+                # 3. Load W_hi tile and compute first dot product
+                bh = tl.load(bh_ptrs, mask=k_mask[:, None], other=0.0)
+                partial_hi = tl.dot(a_fp8, bh, max_num_imprecise_acc=0)
+
+                # 4. Load weight per-block scales
+                sbhi = tl.load(
+                    scales_bhi_ptr
+                    + offs_n * stride_sbhi_n
+                    + kb * stride_sbhi_kb
+                )  # (BLOCK_N,)
+                sblo = tl.load(
+                    scales_blo_ptr
+                    + offs_n * stride_sblo_n
+                    + kb * stride_sblo_kb
+                )  # (BLOCK_N,)
+
+                # 5. Sparsity fast-path: skip W_lo when all scales <= threshold
+                is_sparse = tl.max(sblo) <= SPARSE_THRESHOLD
+                if is_sparse:
+                    combined = partial_hi * sbhi[None, :]
+                else:
+                    bl = tl.load(bl_ptrs, mask=k_mask[:, None], other=0.0)
+                    partial_lo = tl.dot(a_fp8, bl, max_num_imprecise_acc=0)
+                    combined = (
+                        partial_hi * sbhi[None, :]
+                        + partial_lo * sblo[None, :]
+                    )
+
+                acc += combined * inv_scale_a[:, None]
+
+                # 6. Side outputs (pid_n == 0 only — no write-back race)
+                if pid_n == 0:
+                    act_mask = (offs_m_raw[:, None] < M) & (k_mask[None, :])
+                    tl.store(af_ptrs, a_fp8, mask=act_mask)
+                    tl.store(
+                        act_scales_ptr
+                        + offs_m_raw * stride_as_m
+                        + kb * stride_as_kb,
+                        inv_scale_a,
+                        mask=m_mask,
+                    )
+
+                # 7. Advance K pointers
+                a_ptrs += BLOCK_K * stride_ak
+                bh_ptrs += BLOCK_K * stride_bk_hi
+                bl_ptrs += BLOCK_K * stride_bk_lo
+                af_ptrs += BLOCK_K * stride_afk
+
+            # ── Store output (masked for partial tiles) ──
+            offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            out_ptrs = (
+                out_ptr
+                + offs_om[:, None] * stride_om
+                + offs_on[None, :] * stride_on
+            )
+            out_mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+            tl.store(out_ptrs, acc, mask=out_mask)
+
+            tile_id += num_programs
 
 except ImportError:
     pass
@@ -881,7 +1155,7 @@ def block_quantize_fp8(
 
     Returns:
         ``(fp8_tensor, block_inv_scales)`` where fp8_tensor is ``(M, K)``
-        and block_inv_scales is ``(M, K // block_size)`` FP32 dequant
+        and block_inv_scales is ``(K // block_size, M)`` FP32 dequant
         factors.
     """
     M, K = tensor.shape
@@ -892,7 +1166,7 @@ def block_quantize_fp8(
     fp8_max = _FP8_E5M2_MAX if fp8_dtype == torch.float8_e5m2 else _FP8_E4M3_MAX
 
     output = torch.empty((M, K), device=tensor.device, dtype=fp8_dtype)
-    scales = torch.empty((M, num_kb), device=tensor.device, dtype=torch.float32)
+    scales = torch.empty((num_kb, M), device=tensor.device, dtype=torch.float32)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_M"]),  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -909,8 +1183,8 @@ def block_quantize_fp8(
         tensor.stride(1),
         output.stride(0),
         output.stride(1),
-        scales.stride(0),
-        scales.stride(1),
+        scales.stride(1),  # stride_sm: M-dim stride (now axis 1)
+        scales.stride(0),  # stride_sk: kb-dim stride (now axis 0)
         FP8_MAX=fp8_max,
         BLOCK_SIZE=block_size,
     )
@@ -926,7 +1200,7 @@ def block_dequantize_fp8(
 
     Args:
         fp8_tensor:   (M, K) FP8 tensor.
-        block_scales: (M, K // block_size) FP32 inverse scales.
+        block_scales: (K // block_size, M) FP32 inverse scales.
         block_size:   Scaling block size used during quantization.
 
     Returns:
@@ -935,7 +1209,8 @@ def block_dequantize_fp8(
     M, K = fp8_tensor.shape
     num_blocks = K // block_size
     blocked = fp8_tensor.float().reshape(M, num_blocks, block_size)
-    return (blocked * block_scales.unsqueeze(-1)).reshape(M, K)
+    # scales is (num_kb, M) — .t() gives (M, num_kb) view for broadcast
+    return (blocked * block_scales.t().unsqueeze(-1)).reshape(M, K)
 
 
 def fused_dual_quantize_fp8(
@@ -967,7 +1242,7 @@ def fused_dual_quantize_fp8(
 
     Returns:
         ``(w_hi_fp8, w_lo_fp8, scales_hi, scales_lo)`` where the FP8
-        tensors are ``(N, K)`` and the scales are ``(N, K // block_size)``
+        tensors are ``(N, K)`` and the scales are ``(K // block_size, N)``
         FP32 inverse-scales compatible with :func:`block_dequantize_fp8`.
     """
     assert weight.is_contiguous(), "Weight must be contiguous (N, K) row-major"
@@ -987,10 +1262,10 @@ def fused_dual_quantize_fp8(
     w_hi = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
     w_lo = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
     scales_hi = torch.empty(
-        (N, num_kb), device=weight.device, dtype=torch.float32,
+        (num_kb, N), device=weight.device, dtype=torch.float32,
     )
     scales_lo = torch.empty(
-        (N, num_kb), device=weight.device, dtype=torch.float32,
+        (num_kb, N), device=weight.device, dtype=torch.float32,
     )
 
     # Clone error buffer for reading — autotune reruns the kernel multiple
@@ -1029,12 +1304,12 @@ def fused_dual_quantize_fp8(
         # W_lo strides
         w_lo.stride(0),
         w_lo.stride(1),
-        # Scales_hi strides
-        scales_hi.stride(0),
-        scales_hi.stride(1),
-        # Scales_lo strides
-        scales_lo.stride(0),
-        scales_lo.stride(1),
+        # Scales_hi strides (layout: num_kb, N)
+        scales_hi.stride(1),  # stride_sh_n: N-dim stride (axis 1)
+        scales_hi.stride(0),  # stride_sh_kb: kb-dim stride (axis 0)
+        # Scales_lo strides (layout: num_kb, N)
+        scales_lo.stride(1),  # stride_sl_n: N-dim stride (axis 1)
+        scales_lo.stride(0),  # stride_sl_kb: kb-dim stride (axis 0)
         HAS_ERROR=has_error,
         FP8_MAX=_FP8_E4M3_MAX,
         BLOCK_K=block_size,
@@ -1065,8 +1340,8 @@ def block_scaled_gemm(
     Args:
         a_fp8:    (M, K) FP8 input, row-major.
         b_fp8:    (N, K) FP8 weight, row-major (nn.Linear layout).
-        scales_a: (M, K // block_size) FP32 block scales for A.
-        scales_b: (N, K // block_size) FP32 block scales for B.
+        scales_a: (K // block_size, M) FP32 block scales for A.
+        scales_b: (K // block_size, N) FP32 block scales for B.
         block_size: Scaling block size (must match quantization).
 
     Returns:
@@ -1103,10 +1378,10 @@ def block_scaled_gemm(
         b_fp8.stride(0),  # transposed
         output.stride(0),
         output.stride(1),
-        scales_a.stride(0),
-        scales_a.stride(1),
-        scales_b.stride(0),
-        scales_b.stride(1),
+        scales_a.stride(1),  # stride_sa_m: M-dim stride (axis 1)
+        scales_a.stride(0),  # stride_sa_kb: kb-dim stride (axis 0)
+        scales_b.stride(1),  # stride_sb_n: N-dim stride (axis 1)
+        scales_b.stride(0),  # stride_sb_kb: kb-dim stride (axis 0)
         BLOCK_K=block_size,
     )
     return output
@@ -1120,6 +1395,9 @@ def fused_block_scaled_dual_gemm_forward(
     w_hi_scales: torch.Tensor,
     w_lo_scales: torch.Tensor,
     block_size: int,
+    sparse_threshold: float = 0.0,
+    persistent: bool = True,
+    launch_mult: int = 1,
 ) -> torch.Tensor:
     """Fused block-scaled 2-GEMM forward for TCFP-12.
 
@@ -1130,10 +1408,14 @@ def fused_block_scaled_dual_gemm_forward(
         act_fp8:    (M, K) FP8 E4M3 activations, row-major.
         w_hi_fp8:   (N, K) FP8 E4M3 main weight, row-major.
         w_lo_fp8:   (N, K) FP8 E4M3 residual weight, row-major.
-        act_scales:  (M, K // block_size) FP32 block scales.
-        w_hi_scales: (N, K // block_size) FP32 block scales.
-        w_lo_scales: (N, K // block_size) FP32 block scales.
+        act_scales:  (K // block_size, M) FP32 block scales.
+        w_hi_scales: (K // block_size, N) FP32 block scales.
+        w_lo_scales: (K // block_size, N) FP32 block scales.
         block_size: Scaling block size.
+        sparse_threshold: Skip W_lo tiles where max(scale) <= this.
+        persistent: Use persistent tiling (multiple tiles per CTA).
+        launch_mult: CTAs per SM (1 or 2). Higher hides memory latency
+            but increases register pressure.
 
     Returns:
         (M, N) FP32 output tensor.
@@ -1147,9 +1429,20 @@ def fused_block_scaled_dual_gemm_forward(
 
     output = torch.empty((M, N), device=act_fp8.device, dtype=torch.float32)
 
+    num_sms = torch.cuda.get_device_properties(
+        act_fp8.device
+    ).multi_processor_count
+    num_sms_launch = num_sms * launch_mult if persistent else (1 << 30)
+
     grid = lambda META: (  # noqa: E731
-        triton.cdiv(M, META["BLOCK_M"])  # pyright: ignore[reportPossiblyUnboundVariable]
-        * triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
+        max(
+            1,
+            min(
+                num_sms_launch,
+                triton.cdiv(M, META["BLOCK_M"])  # pyright: ignore[reportPossiblyUnboundVariable]
+                * triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
+            ),
+        ),
     )
 
     # W is (N, K) row-major. Kernel sees B = W.T = (K, N).
@@ -1173,15 +1466,118 @@ def fused_block_scaled_dual_gemm_forward(
         w_lo_fp8.stride(0),  # transposed
         output.stride(0),
         output.stride(1),
-        act_scales.stride(0),
-        act_scales.stride(1),
-        w_hi_scales.stride(0),
-        w_hi_scales.stride(1),
-        w_lo_scales.stride(0),
-        w_lo_scales.stride(1),
+        act_scales.stride(1),  # stride_sa_m: M-dim stride (axis 1)
+        act_scales.stride(0),  # stride_sa_kb: kb-dim stride (axis 0)
+        w_hi_scales.stride(1),  # stride_sbhi_n: N-dim stride (axis 1)
+        w_hi_scales.stride(0),  # stride_sbhi_kb: kb-dim stride (axis 0)
+        w_lo_scales.stride(1),  # stride_sblo_n: N-dim stride (axis 1)
+        w_lo_scales.stride(0),  # stride_sblo_kb: kb-dim stride (axis 0)
         BLOCK_K=block_size,
+        SPARSE_THRESHOLD=sparse_threshold,
+        num_sms_launch=num_sms_launch,
     )
     return output
+
+
+def fused_act_quant_dual_gemm_forward(
+    act: torch.Tensor,
+    w_hi_fp8: torch.Tensor,
+    w_lo_fp8: torch.Tensor,
+    w_hi_scales: torch.Tensor,
+    w_lo_scales: torch.Tensor,
+    block_size: int,
+    sparse_threshold: float = 0.0,
+    persistent: bool = True,
+    launch_mult: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused activation quantization + block-scaled 2-GEMM forward.
+
+    Takes BF16/FP32 activation, quantizes per-tile inside the GEMM kernel
+    using power-of-2 scaling, and performs dual dot products with FP8 weights.
+
+    Also writes quantized activation and per-block scales as side outputs
+    (for backward compatibility — backward uses them for weight gradient).
+
+    Args:
+        act:        (M, K) BF16/FP32 activation, row-major.
+        w_hi_fp8:   (N, K) FP8 E4M3 main weight, row-major.
+        w_lo_fp8:   (N, K) FP8 E4M3 residual weight, row-major.
+        w_hi_scales: (K // block_size, N) FP32 block scales.
+        w_lo_scales: (K // block_size, N) FP32 block scales.
+        block_size: Scaling block size.
+        sparse_threshold: Skip W_lo when max(scale_lo) <= threshold.
+        persistent: Use persistent tiling to maximize SM utilization.
+        launch_mult: CTAs per SM (1 or 2). Higher hides memory latency
+            but increases register pressure.
+
+    Returns:
+        ``(output, act_fp8, act_scales)`` where output is ``(M, N)`` FP32,
+        act_fp8 is ``(M, K)`` FP8 E4M3, and act_scales is
+        ``(K // block_size, M)`` FP32.
+    """
+    M, K = act.shape
+    N, K2 = w_hi_fp8.shape
+    assert K == K2 and w_lo_fp8.shape == (N, K), (
+        f"Shape mismatch: act({M},{K}), w_hi({N},{K2}), w_lo{w_lo_fp8.shape}"
+    )
+    assert K % block_size == 0, (
+        f"K ({K}) must be divisible by block_size ({block_size})"
+    )
+    num_kb = K // block_size
+
+    output = torch.empty((M, N), device=act.device, dtype=torch.float32)
+    act_fp8 = torch.empty((M, K), device=act.device, dtype=torch.float8_e4m3fn)
+    act_scales = torch.empty(
+        (num_kb, M), device=act.device, dtype=torch.float32
+    )
+
+    num_sms = torch.cuda.get_device_properties(act.device).multi_processor_count
+    num_sms_launch = num_sms * launch_mult if persistent else (1 << 30)
+
+    grid = lambda META: (  # noqa: E731
+        max(1, min(
+            num_sms_launch,
+            triton.cdiv(M, META["BLOCK_M"])  # pyright: ignore[reportPossiblyUnboundVariable]
+            * triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
+        )),
+    )
+
+    # W is (N, K) row-major. Kernel sees B = W.T = (K, N).
+    _fused_act_quant_dual_gemm_kernel[grid](  # pyright: ignore[reportPossiblyUnboundVariable]
+        act,
+        w_hi_fp8,
+        w_lo_fp8,
+        output,
+        act_fp8,
+        act_scales,
+        w_hi_scales,
+        w_lo_scales,
+        M,
+        N,
+        K,
+        num_kb,
+        act.stride(0),
+        act.stride(1),
+        w_hi_fp8.stride(1),
+        w_hi_fp8.stride(0),  # transposed
+        w_lo_fp8.stride(1),
+        w_lo_fp8.stride(0),  # transposed
+        output.stride(0),
+        output.stride(1),
+        act_fp8.stride(0),
+        act_fp8.stride(1),
+        act_scales.stride(1),  # stride_as_m: M-dim stride (axis 1)
+        act_scales.stride(0),  # stride_as_kb: kb-dim stride (axis 0)
+        w_hi_scales.stride(1),  # stride_sbhi_n: N-dim stride (axis 1)
+        w_hi_scales.stride(0),  # stride_sbhi_kb: kb-dim stride (axis 0)
+        w_lo_scales.stride(1),  # stride_sblo_n: N-dim stride (axis 1)
+        w_lo_scales.stride(0),  # stride_sblo_kb: kb-dim stride (axis 0)
+        FP8_MAX=_FP8_E4M3_MAX,
+        BLOCK_K=block_size,
+        SPARSE_THRESHOLD=sparse_threshold,
+        num_sms_launch=num_sms_launch,
+    )
+    return output, act_fp8, act_scales
 
 
 def fused_block_scaled_dual_gemm_backward_dx(
@@ -1204,9 +1600,9 @@ def fused_block_scaled_dual_gemm_backward_dx(
         grad_fp8:    (M, D_out) FP8 E5M2 gradient.
         w_hi_fp8:    (D_out, D_in) FP8 E4M3 main weight.
         w_lo_fp8:    (D_out, D_in) FP8 E4M3 residual weight.
-        grad_scales: (M, D_out // block_size) FP32 block scales.
-        w_hi_scales: (D_out, D_in // block_size) FP32 block scales.
-        w_lo_scales: (D_out, D_in // block_size) FP32 block scales.
+        grad_scales: (D_out // block_size, M) FP32 block scales.
+        w_hi_scales: (D_in // block_size, D_out) FP32 block scales.
+        w_lo_scales: (D_in // block_size, D_out) FP32 block scales.
         block_size:  Scaling block size.
 
     Returns:

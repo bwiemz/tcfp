@@ -163,7 +163,11 @@ TCFP-12 moves less data than BF16 (12.5 bits vs 16 bits) and raw FP8 GEMMs are 1
 
 3. **Fused dual-GEMM backward** — *(Forward done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. The backward pass still uses two separate dispatches (cuBLASLt doesn't support E5M2 as A-type on SM 12.0+). A Triton kernel that fuses both backward dX GEMMs — loading grad once, computing `grad @ W_hi` and `grad @ W_lo`, adding in registers — would halve backward memory bandwidth.
 
-4. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
+4. **Persistent tiling** — *(Done)* Both dual-GEMM Triton kernels use persistent tiling: each CTA loops over multiple output tiles to eliminate wave quantization (last-wave SM underutilization). Controlled via `persistent=True` (default) and `launch_mult` (CTAs per SM). When the tile count doesn't divide evenly by SM count, persistent tiling keeps all SMs busy.
+
+5. **Residual sparsity fast-path** — *(Done)* K-blocks where `max(scale_lo) <= threshold` skip the W_lo tile load and dot product entirely. Combined with the zero-residual sentinel (`inv_scale=0.0`), sparse residual blocks are detected and skipped at near-zero cost (~5-cycle warp reduction).
+
+6. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
 
 ### Pillar 2: Distributed Training (FSDP / Multi-GPU)
 
@@ -238,6 +242,29 @@ convert_to_tcfp(model, mode=TCFPMode.TCFP12,
 ```
 
 Dispatch priority: cuBLASLt C++ ext > Triton fused > 2x `torch._scaled_mm` + add.
+
+### Persistent Tiling
+
+Both dual-GEMM Triton kernels use persistent tiling to maximize SM utilization. Instead of launching one CTA per output tile (which wastes SMs in the last wave), persistent kernels launch `min(num_sms * launch_mult, total_tiles)` programs that each loop over multiple tiles:
+
+```python
+convert_to_tcfp(model, mode=TCFPMode.TCFP12,
+                use_tensor_cores=True, scale_block_size=64)
+# persistent=True is the default in all block-scaled paths
+```
+
+Controlled via `persistent` (bool, default `True`) and `launch_mult` (int, default `1`) parameters on the kernel wrappers. Setting `persistent=False` reverts to one-CTA-per-tile behavior for A/B testing.
+
+### Residual Sparsity Fast-Path
+
+When a K-block's residual is near-zero (`max(scale_lo) <= threshold`), the W_lo tile load and dot product are skipped entirely. Combined with the zero-residual sentinel (`inv_scale=0.0` for zero blocks), sparse residuals are detected via a ~5-cycle warp reduction and skipped at near-zero overhead:
+
+```python
+# Sparsity threshold can be tuned per-model
+fused_block_scaled_dual_gemm_forward(
+    ..., sparse_threshold=1e-6,
+)
+```
 
 ### Fused Dual Quantization
 
@@ -334,6 +361,8 @@ x_recovered = dequantize_tcfp12(tcfp12)
 - Per-block Triton kernels provide fine-grained dynamic range
 - cuBLASLt C++ extension fuses forward GEMMs via beta=1 accumulation (no intermediate buffer)
 - Fused dual quantization kernel reduces block-scaled forward from ~15 kernels to ~4
+- Persistent tiling eliminates wave quantization for large problems
+- Residual sparsity fast-path skips zero W_lo blocks at near-zero cost
 
 **Current limitations:**
 - **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Fused dual quantization reduces this overhead; fusing quantization into the GEMM itself is the path to >1.0x
@@ -350,7 +379,8 @@ tcfp/
 │   ├── core.py          # FP8 casting, block scales, tensor core utilities,
 │                          error feedback with PDDS delayed scaling
 │   ├── kernels.py       # Triton kernels: fused dual-GEMM, block-scaled GEMM,
-│                          block quantization, fused dual quantization
+│                          block quantization, fused dual quantization,
+│                          persistent tiling, residual sparsity
 │   ├── cuda_ext.py      # cuBLASLt C++ extension JIT loader + Python wrapper
 │   ├── csrc/            # C++ source: fused dual FP8 GEMM via cuBLASLt
 │   │                      beta=1 accumulation (fused_dual_gemm.h/.cu/_bind.cpp)
@@ -359,8 +389,9 @@ tcfp/
 │                          _TCFP12TensorCoreFunction (2-GEMM residual),
 │                          _TCFP12BlockScaledFunction (per-block),
 │                          and PDDS delayed scaling helpers
-├── tests/               # 237 tests covering all modes + tensor core paths
+├── tests/               # 273 tests covering all modes + tensor core paths
 │                          + delayed scaling + block scaling + cuBLASLt ext
+│                          + persistent tiling + residual sparsity
 ├── benchmarks/          # Quality + throughput + TC GEMM + block GEMM benchmarks
 ├── examples/            # Training convergence tests (MNIST + TinyGPT)
 └── pyproject.toml

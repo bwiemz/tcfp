@@ -57,13 +57,13 @@ def _reference_block_scaled_gemm(
     N = b_fp8.shape[0]
     num_kb = K // block_size
 
-    # Dequantize A per-block
+    # Dequantize A per-block — scales are (num_kb, M), .t() → (M, num_kb)
     a_blocked = a_fp8.float().reshape(M, num_kb, block_size)
-    a_deq = (a_blocked * sa.unsqueeze(-1)).reshape(M, K)
+    a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
 
-    # Dequantize B per-block
+    # Dequantize B per-block — scales are (num_kb, N), .t() → (N, num_kb)
     b_blocked = b_fp8.float().reshape(N, num_kb, block_size)
-    b_deq = (b_blocked * sb.unsqueeze(-1)).reshape(N, K)
+    b_deq = (b_blocked * sb.t().unsqueeze(-1)).reshape(N, K)
 
     return a_deq @ b_deq.t()
 
@@ -89,7 +89,7 @@ class TestBlockQuantize:
         fp8, scales = block_quantize_fp8(x, block_size=block_size)  # type: ignore[reportPossiblyUnboundVariable]
 
         assert fp8.shape == (M, K)
-        assert scales.shape == (M, K // block_size)
+        assert scales.shape == (K // block_size, M)
 
     @requires_triton
     def test_output_dtypes(self) -> None:
@@ -272,7 +272,7 @@ class TestFusedBlockScaledDualGemm:
         bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
         # Zero W_lo
         blo_fp8 = torch.zeros(N, K, device=DEVICE, dtype=torch.float8_e4m3fn)
-        sblo = torch.ones(N, K // bs, device=DEVICE)
+        sblo = torch.zeros(K // bs, N, device=DEVICE)
 
         result = fused_block_scaled_dual_gemm_forward(  # type: ignore[reportPossiblyUnboundVariable]
             a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo, block_size=bs,
@@ -525,3 +525,194 @@ class TestBlockScaledIntegration:
             scale_block_size=64,
         )
         assert "scale_block_size=64" in layer.extra_repr()
+
+
+# ── Sparsity Fast-Path Tests ─────────────────────────────────────────────
+
+
+class TestSparsityFastPath:
+    """Tests for the W_lo sparsity skip in fused dual GEMM kernels."""
+
+    @requires_triton
+    def test_zero_lo_sparse_skip(self) -> None:
+        """All-zero W_lo (scale=0.0) should match W_hi-only reference."""
+        M, K, N = 64, 128, 64
+        bs = 32
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8 = torch.zeros(N, K, device=DEVICE, dtype=torch.float8_e4m3fn)
+        sblo = torch.zeros(K // bs, N, device=DEVICE)  # sentinel=0.0
+
+        result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, sparse_threshold=0.0,
+        )
+        ref = _reference_block_scaled_gemm(a_fp8, bhi_fp8, sa, sbhi, bs)
+        assert torch.allclose(result, ref, atol=1e-3)
+
+    @requires_triton
+    def test_partial_sparse_correct(self) -> None:
+        """Mixed sparse/dense K-blocks produce correct output."""
+        M, K, N = 64, 256, 64
+        bs = 64
+        num_kb = K // bs
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        # Zero out odd K-blocks in W_lo (set scale=0.0)
+        for kb in range(num_kb):
+            if kb % 2 == 1:
+                sblo[kb, :] = 0.0
+
+        result_sparse = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, sparse_threshold=0.0,
+        )
+
+        # Reference: manual dequant with the same zero-scale pattern
+        num_blocks = K // bs
+        a_blocked = a_fp8.float().reshape(M, num_blocks, bs)
+        a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
+        bhi_blocked = bhi_fp8.float().reshape(N, num_blocks, bs)
+        bhi_deq = (bhi_blocked * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        blo_blocked = blo_fp8.float().reshape(N, num_blocks, bs)
+        blo_deq = (blo_blocked * sblo.t().unsqueeze(-1)).reshape(N, K)
+        ref = a_deq @ (bhi_deq + blo_deq).t()
+
+        assert torch.allclose(result_sparse, ref, atol=1e-2)
+
+    @requires_triton
+    def test_sparse_threshold_zero_no_regression(self) -> None:
+        """SPARSE_THRESHOLD=0.0 with normal scales produces same output."""
+        M, K, N = 128, 128, 64
+        bs = 32
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        # All scales are > 0 (from _make_block_quantized), so sparsity
+        # path should never trigger. Output must be identical.
+        result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, sparse_threshold=0.0,
+        )
+
+        # Reference with full dequant
+        num_blocks = K // bs
+        a_blocked = a_fp8.float().reshape(M, num_blocks, bs)
+        a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
+        bhi_blocked = bhi_fp8.float().reshape(N, num_blocks, bs)
+        bhi_deq = (bhi_blocked * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        blo_blocked = blo_fp8.float().reshape(N, num_blocks, bs)
+        blo_deq = (blo_blocked * sblo.t().unsqueeze(-1)).reshape(N, K)
+        ref = a_deq @ (bhi_deq + blo_deq).t()
+
+        assert torch.allclose(result, ref, atol=1e-2)
+
+
+# ── Test: Persistent Tiling ─────────────────────────────────────────────
+
+
+class TestPersistentKernel:
+    """Verify persistent tiling produces correct results."""
+
+    @requires_triton
+    def test_persistent_matches_reference(self) -> None:
+        """Large M*N: persistent output matches reference dequant-matmul."""
+        M, K, N = 512, 512, 512
+        bs = 128
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, persistent=True,
+        )
+
+        # Reference with full dequant
+        num_blocks = K // bs
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
+        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
+        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        ref = a_deq @ (bhi_deq + blo_deq).t()
+
+        assert torch.allclose(result, ref, atol=1e-2)
+
+    @requires_triton
+    def test_small_problem_no_regression(self) -> None:
+        """Tiny problem (total_tiles < NUM_SMs): loop runs once, output correct."""
+        M, K, N = 64, 64, 64
+        bs = 32
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, persistent=True,
+        )
+
+        num_blocks = K // bs
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
+        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
+        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        ref = a_deq @ (bhi_deq + blo_deq).t()
+
+        assert torch.allclose(result, ref, atol=1e-2)
+
+    @requires_triton
+    def test_non_divisible_dimensions(self) -> None:
+        """Non-divisible M, N: partial tiles handled correctly in persistent mode."""
+        M, K, N = 100, 128, 100
+        bs = 64
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, persistent=True,
+        )
+
+        num_blocks = K // bs
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
+        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
+        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        ref = a_deq @ (bhi_deq + blo_deq).t()
+
+        assert torch.allclose(result, ref, atol=1e-2)
+
+    @requires_triton
+    def test_persistent_flag_false(self) -> None:
+        """persistent=False produces identical output to persistent=True."""
+        M, K, N = 256, 256, 256
+        bs = 128
+
+        a_fp8, sa = _make_block_quantized(M, K, bs)
+        bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
+        blo_fp8, sblo = _make_block_quantized(N, K, bs)
+
+        result_persistent = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, persistent=True,
+        )
+        result_non_persistent = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
+            block_size=bs, persistent=False,
+        )
+
+        assert torch.allclose(result_persistent, result_non_persistent, atol=1e-6)
