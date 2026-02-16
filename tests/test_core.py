@@ -178,7 +178,6 @@ class TestConfig:
 
     def test_bits_per_value(self) -> None:
         assert bits_per_value(TCFPMode.TCFP12) == 12.5
-        assert bits_per_value(TCFPMode.TCFP16) == 16.5
 
     def test_default_config(self) -> None:
         cfg = FP8Config()

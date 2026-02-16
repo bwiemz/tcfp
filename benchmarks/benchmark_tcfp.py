@@ -38,11 +38,6 @@ try:
 except ImportError:
     _HAS_CUDA_EXT = False
 from tcfp.tcfp12 import fake_quantize_tcfp12
-from tcfp.tcfp16 import (
-    fake_quantize_tcfp16,
-    quantize_tcfp16,
-    tcfp16_matmul,
-)
 
 DEVICE = "cuda"
 WARMUP = 5
@@ -142,14 +137,6 @@ def benchmark_quality() -> None:
                 f"{max_abs_error(x, tcfp12e_recon):<10.2e}"
             )
 
-            # TCFP-16
-            tcfp16_recon = fake_quantize_tcfp16(x)
-            bpv16 = f"{bits_per_value(TCFPMode.TCFP16):.1f}"
-            print(
-                f"  {'':<16} {'TCFP-16':<14} {bpv16:<7} "
-                f"{mse(x, tcfp16_recon):<12.2e} {snr_db(x, tcfp16_recon):<10.1f} "
-                f"{max_abs_error(x, tcfp16_recon):<10.2e}"
-            )
             print()
 
 
@@ -165,9 +152,9 @@ def benchmark_fake_quantize_throughput() -> None:
 
     print(
         f"\n  {'Shape':<16} {'BF16 cast':<12} "
-        f"{'TCFP-12':<12} {'TCFP-12-Enh':<12} {'TCFP-16':<12}"
+        f"{'TCFP-12':<12} {'TCFP-12-Enh':<12}"
     )
-    print(f"  {'-' * 16} {'-' * 12} {'-' * 12} {'-' * 12} {'-' * 12}")
+    print(f"  {'-' * 16} {'-' * 12} {'-' * 12} {'-' * 12}")
 
     for shape in shapes:
         x = torch.randn(*shape, device=DEVICE)
@@ -175,11 +162,10 @@ def benchmark_fake_quantize_throughput() -> None:
         t_bf16 = time_fn(lambda: x.bfloat16().float())
         t_12 = time_fn(lambda: fake_quantize_tcfp12(x))
         t_12e = time_fn(lambda: fake_quantize_tcfp12(x, nf4_residual=True, nf_aware_scaling=True))
-        t_16 = time_fn(lambda: fake_quantize_tcfp16(x))
 
         print(
             f"  {str(shape):<16} {t_bf16:<12.3f} "
-            f"{t_12:<12.3f} {t_12e:<12.3f} {t_16:<12.3f}"
+            f"{t_12:<12.3f} {t_12e:<12.3f}"
         )
 
 
@@ -198,8 +184,8 @@ def benchmark_matmul_throughput() -> None:
         (4096, 4096, 4096),
     ]
 
-    print(f"\n  {'(M,K,N)':<24} {'BF16 mm':<12} {'FP8 TC':<12} {'TCFP-16 3x':<12}")
-    print(f"  {'-' * 24} {'-' * 12} {'-' * 12} {'-' * 12}")
+    print(f"\n  {'(M,K,N)':<24} {'BF16 mm':<12} {'FP8 TC':<12}")
+    print(f"  {'-' * 24} {'-' * 12} {'-' * 12}")
 
     for M, K, N in shapes:
         a = torch.randn(M, K, device=DEVICE)
@@ -215,12 +201,7 @@ def benchmark_matmul_throughput() -> None:
         b_fp8, sb = to_fp8_e4m3(b)
         t_fp8 = time_fn(lambda: fp8_matmul(a_fp8, b_fp8, sa, sb))
 
-        # TCFP-16 (3× FP8)
-        a_q16 = quantize_tcfp16(a)
-        b_q16 = quantize_tcfp16(b)
-        t_16 = time_fn(lambda: tcfp16_matmul(a_q16, b_q16))
-
-        print(f"  {str((M, K, N)):<24} {t_bf16:<12.3f} {t_fp8:<12.3f} {t_16:<12.3f}")
+        print(f"  {str((M, K, N)):<24} {t_bf16:<12.3f} {t_fp8:<12.3f}")
 
 
 # ── Benchmark 3b: Tensor Core GEMM ────────────────────────────────────
@@ -525,7 +506,6 @@ def benchmark_training_step() -> None:
         ("TCFP-12 TC+B128", TCFPMode.TCFP12, {
             "use_tensor_cores": True, "scale_block_size": 128,
         }),
-        ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
 
     print(f"\n  MLP: {hidden}->{4 * hidden}->{hidden}, batch={batch}, seq={seq}")
@@ -572,7 +552,6 @@ def benchmark_vram() -> None:
         ("BF16", 16.0),
         ("FP8", 8.0),
         ("TCFP-12", bits_per_value(TCFPMode.TCFP12)),
-        ("TCFP-16", bits_per_value(TCFPMode.TCFP16)),
     ]
 
     for name, bpv in formats:

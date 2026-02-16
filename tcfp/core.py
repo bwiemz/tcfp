@@ -47,7 +47,6 @@ class TCFPMode(Enum):
     """Available TCFP precision modes."""
 
     TCFP12 = auto()  # FP8 + 4-bit residual (~12.25 bits)
-    TCFP16 = auto()  # Residual FP8 / double FP8 (~16.5 bits)
 
 
 @dataclass
@@ -56,7 +55,7 @@ class FP8Config:
     Configuration for TCFP operations.
 
     Attributes:
-        mode: Precision mode (TCFP12, TCFP16).
+        mode: Precision mode (TCFP12).
         block_size: Number of values sharing a block scale.
         e4m3_for_weights: Use E4M3 for weights (higher precision, lower range).
         e5m2_for_grads: Use E5M2 for gradients (higher range, lower precision).
@@ -573,8 +572,5 @@ def bits_per_value(mode: TCFPMode, block_size: int = DEFAULT_BLOCK_SIZE) -> floa
     if mode == TCFPMode.TCFP12:
         # 8 bits FP8 + 4 bits residual + shared block scale (two scales)
         return 8.0 + 4.0 + 2 * scale_overhead
-    elif mode == TCFPMode.TCFP16:
-        # 8 bits hi + 8 bits lo + two block scales
-        return 16.0 + 2 * scale_overhead
     else:
         raise ValueError(f"Unknown mode: {mode}")

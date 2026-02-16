@@ -274,6 +274,152 @@ try:
         scale_mask = offs_m < M
         tl.store(scale_ptrs, inv_scale, mask=scale_mask)
 
+    # ── Fused dual quantization configs ───────────────────────────────────
+    # Memory-bound quantization kernel: BLOCK_N autotuned, BLOCK_K fixed
+    # (= block_size, constexpr).  Grid is 2D (num_n_blocks, num_k_blocks).
+    _FUSED_DUAL_QUANT_CONFIGS = [
+        triton.Config({"BLOCK_N": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_N": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_N": 64}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 128}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_N": 128}, num_stages=3, num_warps=8),
+    ]
+
+    @triton.autotune(configs=_FUSED_DUAL_QUANT_CONFIGS, key=["N", "K"])
+    @triton.jit
+    def _fused_dual_quantize_kernel(
+        # Pointers
+        w_ptr,
+        error_old_ptr,
+        w_hi_ptr,
+        w_lo_ptr,
+        scales_hi_ptr,
+        scales_lo_ptr,
+        # Dimensions
+        N,
+        K,
+        # Weight strides
+        stride_wn,
+        stride_wk,
+        # Error-old strides
+        stride_eon,
+        stride_eok,
+        # W_hi strides
+        stride_hn,
+        stride_hk,
+        # W_lo strides
+        stride_ln,
+        stride_lk,
+        # Scales_hi strides
+        stride_sh_n,
+        stride_sh_kb,
+        # Scales_lo strides
+        stride_sl_n,
+        stride_sl_kb,
+        # Compile-time constants
+        HAS_ERROR: tl.constexpr,
+        FP8_MAX: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Fused dual FP8 quantisation: W → (W_hi, W_lo) in one pass.
+
+        Each CTA handles one (BLOCK_N, BLOCK_K) tile.  Grid is 2D
+        ``(cdiv(N, BLOCK_N), K // BLOCK_K)`` — no pid_m, no write-back race.
+
+        When ``HAS_ERROR`` is True, the kernel reads old quantisation error
+        from ``error_old_ptr`` and adds it to the weight before quantisation.
+        The new error is computed outside the kernel using stored FP8 values.
+
+        Uses power-of-2 scaling: ``inv_scale = exp2(ceil(log2(amax / FP8_MAX)))``
+        matching :func:`_block_quantize_kernel` exactly.
+        """
+        pid_n = tl.program_id(0)
+        pid_kb = tl.program_id(1)
+
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+
+        # ── 1. Load W tile (coalesced: stride-1 along K) → FP32 ──
+        w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+        w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        # ── 2. Optional error feedback (compile-time branch) ──
+        if HAS_ERROR:
+            err_old_ptrs = (
+                error_old_ptr
+                + offs_n[:, None] * stride_eon
+                + offs_k[None, :] * stride_eok
+            )
+            old_error = tl.load(err_old_ptrs, mask=mask, other=0.0)
+            w_corrected = w_tile + old_error
+        else:
+            w_corrected = w_tile
+
+        # ── 3. Quantize W_hi — power-of-2 scaling ──
+        amax_hi = tl.max(tl.abs(w_corrected), axis=1)  # (BLOCK_N,)
+        amax_hi = tl.maximum(amax_hi, 1e-12)
+        raw_exp_hi = tl.ceil(tl.log2(amax_hi / FP8_MAX))
+        raw_exp_hi = tl.maximum(raw_exp_hi, -126.0)
+        inv_scale_hi = tl.exp2(raw_exp_hi)  # (BLOCK_N,)
+
+        w_hi_scaled = w_corrected / inv_scale_hi[:, None]
+        w_hi_clamped = tl.maximum(tl.minimum(w_hi_scaled, FP8_MAX), -FP8_MAX)
+        w_hi_fp8 = w_hi_clamped.to(w_hi_ptr.dtype.element_ty)
+
+        # ── 4. Compute residual in registers (no GMEM round-trip) ──
+        residual = w_corrected - w_hi_fp8.to(tl.float32) * inv_scale_hi[:, None]
+
+        # ── 5. Quantize W_lo — same power-of-2 scaling ──
+        amax_lo = tl.max(tl.abs(residual), axis=1)  # (BLOCK_N,)
+
+        # Zero-residual fast path: set inv_scale=1.0 BEFORE quantization
+        # so FP8 values and stored scales are consistent (0/1=0 → 0*1=0).
+        zero_residual = amax_lo < 1e-12
+        amax_lo_safe = tl.maximum(amax_lo, 1e-12)  # safe for log2
+
+        raw_exp_lo = tl.ceil(tl.log2(amax_lo_safe / FP8_MAX))
+        raw_exp_lo = tl.maximum(raw_exp_lo, -126.0)
+        inv_scale_lo = tl.exp2(raw_exp_lo)
+        inv_scale_lo = tl.where(zero_residual, 1.0, inv_scale_lo)
+
+        w_lo_scaled = residual / inv_scale_lo[:, None]
+        w_lo_clamped = tl.maximum(tl.minimum(w_lo_scaled, FP8_MAX), -FP8_MAX)
+        w_lo_fp8 = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
+
+        # NOTE: Error update is computed outside the kernel using the stored
+        # FP8 values.  In-kernel dequant can differ from stored-value dequant
+        # due to Triton compiler optimisations folding FP8 casts.
+
+        # ── 6. Store FP8 outputs (coalesced: stride-1 along K) ──
+        hi_ptrs = (
+            w_hi_ptr
+            + offs_n[:, None] * stride_hn
+            + offs_k[None, :] * stride_hk
+        )
+        tl.store(hi_ptrs, w_hi_fp8, mask=mask)
+
+        lo_ptrs = (
+            w_lo_ptr
+            + offs_n[:, None] * stride_ln
+            + offs_k[None, :] * stride_lk
+        )
+        tl.store(lo_ptrs, w_lo_fp8, mask=mask)
+
+        # ── 7. Store per-row inverse scales ──
+        n_mask = offs_n < N
+        tl.store(
+            scales_hi_ptr + offs_n * stride_sh_n + pid_kb * stride_sh_kb,
+            inv_scale_hi,
+            mask=n_mask,
+        )
+        tl.store(
+            scales_lo_ptr + offs_n * stride_sl_n + pid_kb * stride_sl_kb,
+            inv_scale_lo,
+            mask=n_mask,
+        )
+
     # ── Block-scaled GEMM configs ────────────────────────────────────────
     # BLOCK_K is passed as constexpr (= block_size), not autotuned.
     _BLOCK_GEMM_CONFIGS = [
@@ -790,6 +936,119 @@ def block_dequantize_fp8(
     num_blocks = K // block_size
     blocked = fp8_tensor.float().reshape(M, num_blocks, block_size)
     return (blocked * block_scales.unsqueeze(-1)).reshape(M, K)
+
+
+def fused_dual_quantize_fp8(
+    weight: torch.Tensor,
+    block_size: int = 128,
+    error_buf: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused W → W_hi + W_lo dual FP8 quantization in a single kernel.
+
+    Reads the weight matrix once, quantizes both the main component (W_hi)
+    and residual (W_lo) in-register, and writes back both FP8 tensors plus
+    per-block inverse scales.  This replaces 3 separate kernel calls
+    (``block_quantize_fp8`` for W_hi, dequant + subtract for residual,
+    ``block_quantize_fp8`` for W_lo) with a single fused kernel.
+
+    Weight can be BF16 or FP32 — converted to FP32 inside the Triton kernel
+    after the coalesced load (avoids extra Python-side ``.float()`` cast).
+
+    If ``error_buf`` is provided it is **modified in-place**: the kernel reads
+    the old error, applies it (``w_corrected = weight + old_error``), and
+    overwrites the buffer with the new quantisation error
+    (``new_error = weight - dequant(W_hi) - dequant(W_lo)``).
+
+    Args:
+        weight:    (N, K) contiguous tensor in BF16 or FP32.
+        block_size: Scaling block size along K (must divide K).
+        error_buf: Optional (N, K) FP32 contiguous tensor for in-place
+                   error-feedback I/O.
+
+    Returns:
+        ``(w_hi_fp8, w_lo_fp8, scales_hi, scales_lo)`` where the FP8
+        tensors are ``(N, K)`` and the scales are ``(N, K // block_size)``
+        FP32 inverse-scales compatible with :func:`block_dequantize_fp8`.
+    """
+    assert weight.is_contiguous(), "Weight must be contiguous (N, K) row-major"
+    N, K = weight.shape
+    assert K % block_size == 0, (
+        f"K ({K}) must be divisible by block_size ({block_size})"
+    )
+    if error_buf is not None:
+        assert error_buf.dtype == torch.float32, "error_buf must be float32"
+        assert error_buf.shape == (N, K), (
+            f"error_buf shape {error_buf.shape} != weight shape {(N, K)}"
+        )
+        assert error_buf.is_contiguous(), "error_buf must be contiguous"
+
+    num_kb = K // block_size
+
+    w_hi = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
+    w_lo = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
+    scales_hi = torch.empty(
+        (N, num_kb), device=weight.device, dtype=torch.float32,
+    )
+    scales_lo = torch.empty(
+        (N, num_kb), device=weight.device, dtype=torch.float32,
+    )
+
+    # Clone error buffer for reading — autotune reruns the kernel multiple
+    # times so the read source must be stable.  The kernel only READS old
+    # error; new error is computed outside the kernel using stored FP8 values
+    # to avoid Triton compiler cast-folding issues.
+    has_error = error_buf is not None
+    if has_error:
+        error_old = error_buf.clone()
+    else:
+        error_old = weight  # dummy, never accessed
+
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
+        num_kb,
+    )
+
+    _fused_dual_quantize_kernel[grid](  # pyright: ignore[reportPossiblyUnboundVariable]
+        weight,
+        error_old,
+        w_hi,
+        w_lo,
+        scales_hi,
+        scales_lo,
+        N,
+        K,
+        # Weight strides
+        weight.stride(0),
+        weight.stride(1),
+        # Error-old strides
+        error_old.stride(0) if has_error else 0,
+        error_old.stride(1) if has_error else 0,
+        # W_hi strides
+        w_hi.stride(0),
+        w_hi.stride(1),
+        # W_lo strides
+        w_lo.stride(0),
+        w_lo.stride(1),
+        # Scales_hi strides
+        scales_hi.stride(0),
+        scales_hi.stride(1),
+        # Scales_lo strides
+        scales_lo.stride(0),
+        scales_lo.stride(1),
+        HAS_ERROR=has_error,
+        FP8_MAX=_FP8_E4M3_MAX,
+        BLOCK_K=block_size,
+    )
+
+    # Compute new error outside the kernel using stored FP8 values.
+    # In-kernel dequant can differ from stored-value dequant due to
+    # Triton compiler optimisations that fold FP8 round-trip casts.
+    if has_error:
+        w_hi_deq = block_dequantize_fp8(w_hi, scales_hi, block_size)
+        w_lo_deq = block_dequantize_fp8(w_lo, scales_lo, block_size)
+        error_buf.copy_(weight.float() - w_hi_deq - w_lo_deq)  # type: ignore[union-attr]
+
+    return w_hi, w_lo, scales_hi, scales_lo
 
 
 def block_scaled_gemm(

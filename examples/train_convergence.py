@@ -14,7 +14,6 @@ Two real training tasks to validate that TCFP modes actually converge:
 For each task, we train with:
   - BF16 baseline (FP32 master weights, BF16 forward)
   - TCFP-12  (multiple variants: fake-quant, TC, TC+DS, TC+Fused, enhanced, block-scaled)
-  - TCFP-16
 
 Reports: final loss, accuracy/perplexity, loss curve stability.
 
@@ -458,7 +457,6 @@ def main() -> None:
         ("TCFP-12-TC-B128", TCFPMode.TCFP12, {
             "use_tensor_cores": True, "scale_block_size": 128,
         }),
-        ("TCFP-16", TCFPMode.TCFP16, {}),
     ]
 
     # -- MNIST ---------------------------------------------------------

@@ -2,11 +2,9 @@
 TCFP — Tensor Core Floating Point
 ==================================
 
-Hardware-accelerated precision-enhanced FP8 training formats.
-Two modes, all using FP8 tensor cores:
+Hardware-accelerated precision-enhanced FP8 training format.
 
 - **TCFP-12** (~12.5 bits): FP8 + FP8 residual correction (2-GEMM, matches BF16)
-- **TCFP-16** (~16.5 bits): Residual FP8 (double FP8, near-BF16 quality)
 """
 
 from __future__ import annotations

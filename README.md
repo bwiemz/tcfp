@@ -1,15 +1,14 @@
 # TCFP — Tensor Core Floating Point
 
-**Hardware-accelerated precision-enhanced FP8 training formats with real tensor core GEMMs.**
+**Hardware-accelerated precision-enhanced FP8 training format with real tensor core GEMMs.**
 
 TCFP uses FP8 tensor cores (NVIDIA Hopper, Ada Lovelace, Blackwell) for actual compute — not just storage. The key innovation is **TCFP-12 on tensor cores**: a novel 2-GEMM residual FP8 decomposition that matches BF16 training quality while running on FP8 hardware.
 
-| Mode | Bits/value | Tensor Core Path | Speed vs BF16 | Trains Transformers? |
-|------|-----------|-----------------|---------------|---------------------|
+| Variant | Bits/value | Tensor Core Path | Speed vs BF16 | Trains Transformers? |
+|---------|-----------|-----------------|---------------|---------------------|
 | **TCFP-12** | 12.5 | **2 FP8 GEMMs (novel)** | **0.84x (faster)** | **Yes — matches BF16 exactly** |
 | **TCFP-12+DS** | 12.5 | **2 FP8 GEMMs + PDDS** | **1.19x** | **Yes — matches BF16 exactly** |
 | **TCFP-12+Block** | 12.5 | **2 Triton block-scaled GEMMs** | ~2.6x | **Yes — matches BF16 exactly** |
-| **TCFP-16** | 16.5 | 3 FP8 GEMMs | ~1.4x | Yes |
 
 ## The Problem: FP8 Tensor Cores Are Underutilized
 
@@ -53,7 +52,6 @@ Measured on **RTX 5070 Ti** (Blackwell, 16GB VRAM), PyTorch 2.10, CUDA 12.8.
 | TCFP-12 TC+B64 | 49.8 | 2.57x | Yes (ppl 1.9) |
 | TCFP-12 TC+B128 | 49.5 | 2.55x | Yes (ppl 1.9) |
 | TCFP-12 fake-quantize | 43.1 | 2.22x | Yes (ppl 1.9) |
-| TCFP-16 | 43.0 | 2.22x | Yes (ppl 1.9) |
 
 ### Raw GEMM Performance (4096 x 4096 x 4096)
 
@@ -72,7 +70,6 @@ At large sizes, FP8 TC GEMMs are ~1.9x faster than BF16. The Triton block-scaled
 | BF16 | 16.0 | 2.76e-06 | 55.6 |
 | Naive FP8 | 8.0 | 7.02e-04 | 31.5 |
 | **TCFP-12** | 12.5 | 2.48e-05 | 46.0 |
-| **TCFP-16** | 16.5 | 3.93e-07 | 64.1 |
 
 ### Training Convergence (TinyGPT: 4-layer transformer, d=256, 1000 steps)
 
@@ -83,7 +80,6 @@ At large sizes, FP8 TC GEMMs are ~1.9x faster than BF16. The Triton block-scaled
 | **TCFP-12 TC+DS** | **0.663** | **1.9** | **Converged** |
 | TCFP-12 TC+B32/B64/B128 | 0.662 | 1.9 | Converged |
 | TCFP-12 fake-quantize | 0.662 | 1.9 | Converged |
-| TCFP-16 | 0.662 | 1.9 | Converged |
 | Pure FP8 (any path) | 4.02 | 55.6 | **Failed** |
 
 All TCFP-12 variants match BF16 step-for-step (ppl ratio 1.002-1.003x). Pure FP8 fails on transformers regardless of enhancements.
@@ -161,11 +157,13 @@ TCFP-12 TC is a research prototype. Three pillars define "production-ready":
 
 TCFP-12 moves less data than BF16 (12.5 bits vs 16 bits) and raw FP8 GEMMs are 1.9x faster. The physics says we should be *faster* than BF16 — the current 1.8x slowdown comes from quantization overhead, not the GEMMs themselves. The path to closing this gap:
 
-1. **Fuse quantization + GEMM** — The biggest overhead is quantizing W to FP8, computing the residual, and quantizing W_lo *before* each forward pass. Fusing quantization into the GEMM launch (quantize tiles on-the-fly as they're loaded from GMEM into SMEM) would eliminate the separate quantization kernels entirely. This is the single highest-impact optimization.
+1. **Fused dual quantization** — *(Done)* A single Triton kernel (`fused_dual_quantize_fp8`) replaces 6 separate kernels: error feedback add, `block_quantize_fp8(W)`, dequantization, residual subtraction, `block_quantize_fp8(residual)`, and error update. The weight is read from GMEM once (in native BF16/FP32 dtype), and W_hi, W_lo, scales, and error update are all computed in registers. Reduces the block-scaled forward pass from ~15 kernels to ~4. Uses power-of-2 scaling for bitwise parity with the separate-kernel path.
 
-2. **Fused dual-GEMM backward** — *(Forward done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. The backward pass still uses two separate dispatches (cuBLASLt doesn't support E5M2 as A-type on SM 12.0+). A Triton kernel that fuses both backward dX GEMMs — loading grad once, computing `grad @ W_hi` and `grad @ W_lo`, adding in registers — would halve backward memory bandwidth. Triton bypasses the cuBLASLt E5M2 limitation since it generates PTX directly.
+2. **Fuse quantization into GEMM** — The next step: quantize W tiles on-the-fly as they're loaded from GMEM into SMEM inside the GEMM kernel itself. This would eliminate the quantization kernels entirely, leaving only the GEMM + bias add.
 
-3. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
+3. **Fused dual-GEMM backward** — *(Forward done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. The backward pass still uses two separate dispatches (cuBLASLt doesn't support E5M2 as A-type on SM 12.0+). A Triton kernel that fuses both backward dX GEMMs — loading grad once, computing `grad @ W_hi` and `grad @ W_lo`, adding in registers — would halve backward memory bandwidth.
+
+4. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
 
 ### Pillar 2: Distributed Training (FSDP / Multi-GPU)
 
@@ -241,17 +239,34 @@ convert_to_tcfp(model, mode=TCFPMode.TCFP12,
 
 Dispatch priority: cuBLASLt C++ ext > Triton fused > 2x `torch._scaled_mm` + add.
 
-## How Each Mode Works
+### Fused Dual Quantization
 
-### TCFP-12: FP8 + Residual Correction
+Single Triton kernel that fuses the entire weight quantization pipeline for the block-scaled path:
+
+**Before** (6 separate kernel launches):
+1. Error feedback: `w = weight + error_buf`
+2. `block_quantize_fp8(w)` -> W_hi + scales_hi
+3. `block_dequantize_fp8(W_hi)` -> w_hi_deq
+4. `residual = w - w_hi_deq`
+5. `block_quantize_fp8(residual)` -> W_lo + scales_lo
+6. Error update: `new_error = weight - dequant(W_hi) - dequant(W_lo)`
+
+**After** (1 kernel launch):
+```python
+w_hi, w_lo, scales_hi, scales_lo = fused_dual_quantize_fp8(
+    weight, block_size=128, error_buf=error_buf,
+)
+```
+
+The kernel loads the weight once from GMEM (in native BF16/FP32 dtype, converted to FP32 inside the kernel after coalesced load), applies error feedback, quantizes W_hi with power-of-2 scaling, computes the residual in registers (no GMEM round-trip), quantizes W_lo, and writes all outputs. Produces bitwise-identical results to the separate-kernel path. Used automatically by `_TCFP12BlockScaledFunction` when Triton is available.
+
+## How TCFP-12 Works
+
+### FP8 + Residual Correction
 
 **Tensor core path** (the novel contribution): FP8 main + FP8 residual, computed via 2 real FP8 tensor core GEMMs. Error feedback tracks the total (hi+lo) quantization error.
 
 **Fake-quantize path** (for reference/testing): FP8 main + 4-bit NF4 residual, computed with `F.linear`.
-
-### TCFP-16: Residual FP8 (Double FP8)
-
-Two FP8 E4M3 values per element. Matmul uses 3 FP8 tensor core GEMMs (hi x hi, hi x lo, lo x hi). Near-BF16 quality but slower due to 3x GEMM overhead.
 
 ## Installation
 
@@ -301,15 +316,11 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 ```python
 from tcfp.tcfp12 import quantize_tcfp12, dequantize_tcfp12
-from tcfp.tcfp16 import quantize_tcfp16, dequantize_tcfp16
 
 x = torch.randn(1024, 1024, device="cuda")
 
 tcfp12 = quantize_tcfp12(x)
 x_recovered = dequantize_tcfp12(tcfp12)
-
-tcfp16 = quantize_tcfp16(x)
-x_recovered = dequantize_tcfp16(tcfp16)
 ```
 
 ## Honest Assessment
@@ -322,9 +333,10 @@ x_recovered = dequantize_tcfp16(tcfp16)
 - PDDS eliminates W_lo amax computation with zero quality loss
 - Per-block Triton kernels provide fine-grained dynamic range
 - cuBLASLt C++ extension fuses forward GEMMs via beta=1 accumulation (no intermediate buffer)
+- Fused dual quantization kernel reduces block-scaled forward from ~15 kernels to ~4
 
 **Current limitations:**
-- **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Fusing quantization into the GEMM is the path to >1.0x
+- **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Fused dual quantization reduces this overhead; fusing quantization into the GEMM itself is the path to >1.0x
 - **Single-GPU only**: Not validated with distributed training (FSDP, TP, PP) — the primary blocker for real-world adoption
 - **No framework integration**: Requires manual `convert_to_tcfp()` call, no HuggingFace/DeepSpeed drop-in support yet
 - **Partial kernel fusion**: cuBLASLt fuses forward GEMMs but backward still dispatches separately (E5M2 limitation)
@@ -338,12 +350,11 @@ tcfp/
 │   ├── core.py          # FP8 casting, block scales, tensor core utilities,
 │                          error feedback with PDDS delayed scaling
 │   ├── kernels.py       # Triton kernels: fused dual-GEMM, block-scaled GEMM,
-│                          block quantization
+│                          block quantization, fused dual quantization
 │   ├── cuda_ext.py      # cuBLASLt C++ extension JIT loader + Python wrapper
 │   ├── csrc/            # C++ source: fused dual FP8 GEMM via cuBLASLt
 │   │                      beta=1 accumulation (fused_dual_gemm.h/.cu/_bind.cpp)
 │   ├── tcfp12/          # FP8 + 4-bit residual (fake-quantize path)
-│   ├── tcfp16/          # Residual FP8 (double FP8)
 │   └── nn/              # Drop-in modules (TCFPLinear, TCFPLayerNorm, etc.)
 │                          _TCFP12TensorCoreFunction (2-GEMM residual),
 │                          _TCFP12BlockScaledFunction (per-block),

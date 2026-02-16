@@ -31,7 +31,6 @@ from tcfp.core import (
     to_fp8_e5m2,
 )
 from tcfp.tcfp12 import fake_quantize_tcfp12
-from tcfp.tcfp16 import fake_quantize_tcfp16
 
 # Fused Triton kernels (optional — graceful fallback to torch._scaled_mm)
 try:
@@ -42,6 +41,7 @@ try:
         fused_block_scaled_dual_gemm_forward,
         fused_dual_gemm_backward_dx,
         fused_dual_gemm_forward,
+        fused_dual_quantize_fp8,
         is_triton_available,
     )
 
@@ -88,8 +88,6 @@ class _STEFakeQuantize(torch.autograd.Function):
                 sigma_factor=sigma_factor,
                 stochastic_rounding=stochastic_rounding,
             )
-        elif mode == TCFPMode.TCFP16:
-            return fake_quantize_tcfp16(x, block_size=block_size)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -549,32 +547,24 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         error_state: ErrorFeedbackState | None,
         param_name: str,
     ) -> torch.Tensor:
-        # --- 1. Error feedback on weight ---
-        w = weight.float()
+        # --- 1-4. Fused dual quantise: W → W_hi + W_lo + scales + error ---
+        # Single Triton kernel replaces error-feedback add, two
+        # block_quantize_fp8 calls, dequant, and residual subtraction.
+        error_buf: torch.Tensor | None = None
         if error_state is not None:
-            error_buf = error_state.get_error(param_name, w)
-            w = w + error_buf
+            # get_error creates buffer with same dtype as `like` — must be FP32
+            error_buf = error_state.get_error(param_name, weight.float())
 
-        # --- 2. Block-quantise W_hi (main component) ---
-        w_hi_fp8, w_hi_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
-            w, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
+        w_hi_fp8, w_lo_fp8, w_hi_scales, w_lo_scales = fused_dual_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            weight,
+            block_size=scale_block_size,
+            error_buf=error_buf,
         )
 
-        # --- 3. Compute residual and block-quantise W_lo ---
-        w_hi_deq = block_dequantize_fp8(w_hi_fp8, w_hi_scales, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
-        residual = w - w_hi_deq
-        w_lo_fp8, w_lo_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
-            residual, block_size=scale_block_size, fp8_dtype=torch.float8_e4m3fn,
-        )
-
-        # --- 4. Error feedback: store total quantisation error ---
-        if error_state is not None:
-            w_lo_deq = block_dequantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
-                w_lo_fp8, w_lo_scales, scale_block_size,
-            )
-            w_reconstructed = w_hi_deq + w_lo_deq
-            quant_error = weight.float() - w_reconstructed
-            error_state.update_error(param_name, quant_error)
+        # error_buf is modified in-place by fused_dual_quantize_fp8 —
+        # ErrorFeedbackState.get_error returns a reference to the internal
+        # buffer, so no explicit update_error() call needed.
+        # (new_error = weight - dequant(W_hi) - dequant(W_lo))
 
         # --- 5. Flatten input to 2D, block-quantise activation ---
         input_shape = input.shape
@@ -743,12 +733,6 @@ class TCFPLinear(nn.Module):
             warnings.warn(
                 "delayed_scaling requires use_tensor_cores=True and is "
                 "ignored without it.",
-                stacklevel=2,
-            )
-        if delayed_scaling and mode != TCFPMode.TCFP12:
-            warnings.warn(
-                "delayed_scaling is only supported for TCFP12 tensor core "
-                "mode and is ignored for other modes.",
                 stacklevel=2,
             )
         self.in_features = in_features

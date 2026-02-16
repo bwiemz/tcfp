@@ -385,14 +385,6 @@ class TestDelayedScalingAPI:
                 use_tensor_cores=False, delayed_scaling=True,
             )
 
-    def test_delayed_scaling_with_tcfp16_warns(self) -> None:
-        """Warning when delayed_scaling used with non-TCFP12."""
-        with pytest.warns(UserWarning, match="only supported for TCFP12"):
-            TCFPLinear(
-                128, 64, mode=TCFPMode.TCFP16,
-                use_tensor_cores=True, delayed_scaling=True,
-            )
-
     def test_delayed_scaling_in_extra_repr(self) -> None:
         """delayed_scaling=True appears in extra_repr output."""
         layer = TCFPLinear(
