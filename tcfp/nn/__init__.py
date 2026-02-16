@@ -585,6 +585,7 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
                 input_2d, w_hi_fp8, w_lo_fp8,
                 w_hi_scales, w_lo_scales,
                 block_size=scale_block_size,
+                save_side_outputs=not hp_grad_weight,
             )
         else:
             act_fp8, act_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -608,10 +609,17 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         ctx.input_shape = input_shape  # pyright: ignore[reportAttributeAccessIssue]
         ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
         ctx.scale_block_size = scale_block_size  # pyright: ignore[reportAttributeAccessIssue]
+        # When hp_grad_weight=True and fused path was used, act_scales is
+        # None (side outputs elided). Save a 0-element placeholder to keep
+        # backward indexing stable — it's never accessed in that path.
+        act_scales_save = (
+            act_scales if act_scales is not None
+            else torch.empty(0, device=input.device, dtype=torch.int8)
+        )
         saved = [
             input_2d if hp_grad_weight else act_fp8,
             w_hi_fp8, w_lo_fp8,
-            w_hi_scales, w_lo_scales, act_scales,
+            w_hi_scales, w_lo_scales, act_scales_save,
         ]
         if bias is not None:
             saved.append(bias)

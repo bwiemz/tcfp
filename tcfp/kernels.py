@@ -272,7 +272,7 @@ try:
         # Store inverse scales
         scale_ptrs = scales_ptr + offs_m * stride_sm + pid_kb * stride_sk
         scale_mask = offs_m < M
-        tl.store(scale_ptrs, inv_scale, mask=scale_mask)
+        tl.store(scale_ptrs, raw_exp.to(tl.int8), mask=scale_mask)
 
     # ── Fused dual quantization configs ───────────────────────────────────
     # Memory-bound quantization kernel: BLOCK_N autotuned, BLOCK_K fixed
@@ -390,10 +390,6 @@ try:
         w_lo_clamped = tl.maximum(tl.minimum(w_lo_scaled, FP8_MAX), -FP8_MAX)
         w_lo_fp8 = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
 
-        # Store 0.0 sentinel for zero residuals — GEMM kernels can skip
-        # W_lo tile loads when scale==0.0
-        inv_scale_lo = tl.where(zero_residual, 0.0, inv_scale_lo)
-
         # NOTE: Error update is computed outside the kernel using the stored
         # FP8 values.  In-kernel dequant can differ from stored-value dequant
         # due to Triton compiler optimisations folding FP8 casts.
@@ -413,16 +409,18 @@ try:
         )
         tl.store(lo_ptrs, w_lo_fp8, mask=mask)
 
-        # ── 7. Store per-row inverse scales ──
+        # ── 7. Store int8 exponents (E8M0: 4x smaller than FP32 scales) ──
+        # Sentinel: -128 for zero-residual blocks (GEMM kernels skip W_lo)
         n_mask = offs_n < N
         tl.store(
             scales_hi_ptr + offs_n * stride_sh_n + pid_kb * stride_sh_kb,
-            inv_scale_hi,
+            raw_exp_hi.to(tl.int8),
             mask=n_mask,
         )
+        exp_lo_store = tl.where(zero_residual, -128.0, raw_exp_lo)
         tl.store(
             scales_lo_ptr + offs_n * stride_sl_n + pid_kb * stride_sl_kb,
-            inv_scale_lo,
+            exp_lo_store.to(tl.int8),
             mask=n_mask,
         )
 
@@ -541,13 +539,13 @@ try:
             # FP8 dot product -> FP32 partial result
             partial = tl.dot(a, b, max_num_imprecise_acc=0)
 
-            # Load per-block scales for this K-block
-            sa = tl.load(
+            # Load int8 exponents and reconstruct FP32 scales via exp2
+            sa = tl.exp2(tl.load(
                 scales_a_ptr + offs_m * stride_sa_m + kb * stride_sa_kb
-            )  # (BLOCK_M,)
-            sb = tl.load(
+            ).to(tl.float32))  # (BLOCK_M,)
+            sb = tl.exp2(tl.load(
                 scales_b_ptr + offs_n * stride_sb_n + kb * stride_sb_kb
-            )  # (BLOCK_N,)
+            ).to(tl.float32))  # (BLOCK_N,)
 
             # Apply scale correction and accumulate
             acc += partial * (sa[:, None] * sb[None, :])
@@ -713,20 +711,23 @@ try:
 
                 partial_hi = tl.dot(a, bh, max_num_imprecise_acc=0)
 
-                # Load per-block scales
-                sa = tl.load(
+                # Load int8 exponents and reconstruct FP32 scales via exp2
+                sa = tl.exp2(tl.load(
                     scales_a_ptr + offs_m * stride_sa_m + kb * stride_sa_kb
-                )  # (BLOCK_M,)
-                sbhi = tl.load(
+                ).to(tl.float32))  # (BLOCK_M,)
+                sbhi = tl.exp2(tl.load(
                     scales_bhi_ptr
                     + offs_n * stride_sbhi_n
                     + kb * stride_sbhi_kb
-                )  # (BLOCK_N,)
-                sblo = tl.load(
+                ).to(tl.float32))  # (BLOCK_N,)
+                sblo_raw = tl.load(
                     scales_blo_ptr
                     + offs_n * stride_sblo_n
                     + kb * stride_sblo_kb
-                )  # (BLOCK_N,)
+                )  # int8 (BLOCK_N,)
+                sblo = tl.exp2(sblo_raw.to(tl.float32))
+                # Restore zero sentinel: int8 -128 → FP32 0.0
+                sblo = tl.where(sblo_raw == -128, 0.0, sblo)
 
                 # Sparsity fast-path: skip W_lo when all scales <= threshold
                 is_sparse = tl.max(sblo) <= SPARSE_THRESHOLD
@@ -842,6 +843,7 @@ try:
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
         SPARSE_THRESHOLD: tl.constexpr,
+        SAVE_SIDE_OUTPUTS: tl.constexpr,
         num_sms_launch,
     ):
         """Fused activation quantization + dual-GEMM with per-block scales.
@@ -906,11 +908,12 @@ try:
             )
 
             # Side-output pointers (advance per K-block in loop)
-            af_ptrs = (
-                act_fp8_ptr
-                + offs_m_raw[:, None] * stride_afm
-                + offs_k[None, :] * stride_afk
-            )
+            if SAVE_SIDE_OUTPUTS:
+                af_ptrs = (
+                    act_fp8_ptr
+                    + offs_m_raw[:, None] * stride_afm
+                    + offs_k[None, :] * stride_afk
+                )
 
             # ── FP32 accumulator (re-initialised per tile) ──
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -942,17 +945,20 @@ try:
                 bh = tl.load(bh_ptrs, mask=k_mask[:, None], other=0.0)
                 partial_hi = tl.dot(a_fp8, bh, max_num_imprecise_acc=0)
 
-                # 4. Load weight per-block scales
-                sbhi = tl.load(
+                # 4. Load int8 weight exponents, reconstruct FP32 scales
+                sbhi = tl.exp2(tl.load(
                     scales_bhi_ptr
                     + offs_n * stride_sbhi_n
                     + kb * stride_sbhi_kb
-                )  # (BLOCK_N,)
-                sblo = tl.load(
+                ).to(tl.float32))  # (BLOCK_N,)
+                sblo_raw = tl.load(
                     scales_blo_ptr
                     + offs_n * stride_sblo_n
                     + kb * stride_sblo_kb
-                )  # (BLOCK_N,)
+                )  # int8 (BLOCK_N,)
+                sblo = tl.exp2(sblo_raw.to(tl.float32))
+                # Restore zero sentinel: int8 -128 → FP32 0.0
+                sblo = tl.where(sblo_raw == -128, 0.0, sblo)
 
                 # 5. Sparsity fast-path: skip W_lo when all scales <= threshold
                 is_sparse = tl.max(sblo) <= SPARSE_THRESHOLD
@@ -969,14 +975,14 @@ try:
                 acc += combined * inv_scale_a[:, None]
 
                 # 6. Side outputs (pid_n == 0 only — no write-back race)
-                if pid_n == 0:
+                if SAVE_SIDE_OUTPUTS and pid_n == 0:
                     act_mask = (offs_m_raw[:, None] < M) & (k_mask[None, :])
                     tl.store(af_ptrs, a_fp8, mask=act_mask)
                     tl.store(
                         act_scales_ptr
                         + offs_m_raw * stride_as_m
                         + kb * stride_as_kb,
-                        inv_scale_a,
+                        raw_exp.to(tl.int8),
                         mask=m_mask,
                     )
 
@@ -984,7 +990,8 @@ try:
                 a_ptrs += BLOCK_K * stride_ak
                 bh_ptrs += BLOCK_K * stride_bk_hi
                 bl_ptrs += BLOCK_K * stride_bk_lo
-                af_ptrs += BLOCK_K * stride_afk
+                if SAVE_SIDE_OUTPUTS:
+                    af_ptrs += BLOCK_K * stride_afk
 
             # ── Store output (masked for partial tiles) ──
             offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1154,9 +1161,9 @@ def block_quantize_fp8(
         fp8_dtype: Target FP8 type (``float8_e4m3fn`` or ``float8_e5m2``).
 
     Returns:
-        ``(fp8_tensor, block_inv_scales)`` where fp8_tensor is ``(M, K)``
-        and block_inv_scales is ``(K // block_size, M)`` FP32 dequant
-        factors.
+        ``(fp8_tensor, block_exponents)`` where fp8_tensor is ``(M, K)``
+        and block_exponents is ``(K // block_size, M)`` int8 E8M0
+        exponents (scale = 2^exp).
     """
     M, K = tensor.shape
     assert K % block_size == 0, (
@@ -1166,7 +1173,7 @@ def block_quantize_fp8(
     fp8_max = _FP8_E5M2_MAX if fp8_dtype == torch.float8_e5m2 else _FP8_E4M3_MAX
 
     output = torch.empty((M, K), device=tensor.device, dtype=fp8_dtype)
-    scales = torch.empty((num_kb, M), device=tensor.device, dtype=torch.float32)
+    scales = torch.empty((num_kb, M), device=tensor.device, dtype=torch.int8)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_M"]),  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -1200,7 +1207,7 @@ def block_dequantize_fp8(
 
     Args:
         fp8_tensor:   (M, K) FP8 tensor.
-        block_scales: (K // block_size, M) FP32 inverse scales.
+        block_scales: (K // block_size, M) int8 exponents (E8M0 encoding).
         block_size:   Scaling block size used during quantization.
 
     Returns:
@@ -1209,8 +1216,10 @@ def block_dequantize_fp8(
     M, K = fp8_tensor.shape
     num_blocks = K // block_size
     blocked = fp8_tensor.float().reshape(M, num_blocks, block_size)
+    # Reconstruct FP32 scales from int8 exponents: scale = 2^exp
+    float_scales = torch.exp2(block_scales.float())
     # scales is (num_kb, M) — .t() gives (M, num_kb) view for broadcast
-    return (blocked * block_scales.t().unsqueeze(-1)).reshape(M, K)
+    return (blocked * float_scales.t().unsqueeze(-1)).reshape(M, K)
 
 
 def fused_dual_quantize_fp8(
@@ -1262,10 +1271,10 @@ def fused_dual_quantize_fp8(
     w_hi = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
     w_lo = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
     scales_hi = torch.empty(
-        (num_kb, N), device=weight.device, dtype=torch.float32,
+        (num_kb, N), device=weight.device, dtype=torch.int8,
     )
     scales_lo = torch.empty(
-        (num_kb, N), device=weight.device, dtype=torch.float32,
+        (num_kb, N), device=weight.device, dtype=torch.int8,
     )
 
     # Clone error buffer for reading — autotune reruns the kernel multiple
@@ -1489,14 +1498,16 @@ def fused_act_quant_dual_gemm_forward(
     sparse_threshold: float = 0.0,
     persistent: bool = True,
     launch_mult: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    save_side_outputs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused activation quantization + block-scaled 2-GEMM forward.
 
     Takes BF16/FP32 activation, quantizes per-tile inside the GEMM kernel
     using power-of-2 scaling, and performs dual dot products with FP8 weights.
 
-    Also writes quantized activation and per-block scales as side outputs
-    (for backward compatibility — backward uses them for weight gradient).
+    When ``save_side_outputs=True``, also writes quantized activation and
+    per-block scales as side outputs (backward uses them for weight gradient
+    when ``hp_grad_weight=False``).
 
     Args:
         act:        (M, K) BF16/FP32 activation, row-major.
@@ -1509,11 +1520,13 @@ def fused_act_quant_dual_gemm_forward(
         persistent: Use persistent tiling to maximize SM utilization.
         launch_mult: CTAs per SM (1 or 2). Higher hides memory latency
             but increases register pressure.
+        save_side_outputs: Write quantized activation and scales as side
+            outputs. Set False when backward uses FP32 input directly
+            (``hp_grad_weight=True``), saving ~8 MB of VRAM writes.
 
     Returns:
-        ``(output, act_fp8, act_scales)`` where output is ``(M, N)`` FP32,
-        act_fp8 is ``(M, K)`` FP8 E4M3, and act_scales is
-        ``(K // block_size, M)`` FP32.
+        ``(output, act_fp8, act_scales)`` where output is ``(M, N)`` FP32.
+        When ``save_side_outputs=False``, act_fp8 and act_scales are None.
     """
     M, K = act.shape
     N, K2 = w_hi_fp8.shape
@@ -1526,10 +1539,23 @@ def fused_act_quant_dual_gemm_forward(
     num_kb = K // block_size
 
     output = torch.empty((M, N), device=act.device, dtype=torch.float32)
-    act_fp8 = torch.empty((M, K), device=act.device, dtype=torch.float8_e4m3fn)
-    act_scales = torch.empty(
-        (num_kb, M), device=act.device, dtype=torch.float32
-    )
+
+    if save_side_outputs:
+        act_fp8 = torch.empty(
+            (M, K), device=act.device, dtype=torch.float8_e4m3fn,
+        )
+        act_scales = torch.empty(
+            (num_kb, M), device=act.device, dtype=torch.int8,
+        )
+    else:
+        # Dummy 1-element tensors — kernel needs valid pointers but
+        # SAVE_SIDE_OUTPUTS=False eliminates all stores via constexpr.
+        act_fp8 = torch.empty(
+            (1,), device=act.device, dtype=torch.float8_e4m3fn,
+        )
+        act_scales = torch.empty(
+            (1,), device=act.device, dtype=torch.int8,
+        )
 
     num_sms = torch.cuda.get_device_properties(act.device).multi_processor_count
     num_sms_launch = num_sms * launch_mult if persistent else (1 << 30)
@@ -1565,9 +1591,9 @@ def fused_act_quant_dual_gemm_forward(
         output.stride(0),
         output.stride(1),
         act_fp8.stride(0),
-        act_fp8.stride(1),
-        act_scales.stride(1),  # stride_as_m: M-dim stride (axis 1)
-        act_scales.stride(0),  # stride_as_kb: kb-dim stride (axis 0)
+        act_fp8.stride(-1),
+        act_scales.stride(-1),  # stride_as_m (dummy-safe)
+        act_scales.stride(0),   # stride_as_kb (dummy-safe)
         w_hi_scales.stride(1),  # stride_sbhi_n: N-dim stride (axis 1)
         w_hi_scales.stride(0),  # stride_sbhi_kb: kb-dim stride (axis 0)
         w_lo_scales.stride(1),  # stride_sblo_n: N-dim stride (axis 1)
@@ -1575,9 +1601,12 @@ def fused_act_quant_dual_gemm_forward(
         FP8_MAX=_FP8_E4M3_MAX,
         BLOCK_K=block_size,
         SPARSE_THRESHOLD=sparse_threshold,
+        SAVE_SIDE_OUTPUTS=save_side_outputs,
         num_sms_launch=num_sms_launch,
     )
-    return output, act_fp8, act_scales
+    if save_side_outputs:
+        return output, act_fp8, act_scales
+    return output, None, None
 
 
 def fused_block_scaled_dual_gemm_backward_dx(
@@ -1600,9 +1629,9 @@ def fused_block_scaled_dual_gemm_backward_dx(
         grad_fp8:    (M, D_out) FP8 E5M2 gradient.
         w_hi_fp8:    (D_out, D_in) FP8 E4M3 main weight.
         w_lo_fp8:    (D_out, D_in) FP8 E4M3 residual weight.
-        grad_scales: (D_out // block_size, M) FP32 block scales.
-        w_hi_scales: (D_in // block_size, D_out) FP32 block scales.
-        w_lo_scales: (D_in // block_size, D_out) FP32 block scales.
+        grad_scales: (D_out // block_size, M) int8 exponents (E8M0).
+        w_hi_scales: (D_in // block_size, D_out) int8 exponents (E8M0).
+        w_lo_scales: (D_in // block_size, D_out) int8 exponents (E8M0).
         block_size:  Scaling block size.
 
     Returns:

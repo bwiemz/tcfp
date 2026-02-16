@@ -139,8 +139,8 @@ class TestSideOutputParity:
             act, w_hi, w_lo, s_hi, s_lo, block_size=128,
         )
 
-        assert torch.allclose(ref_scales, fused_scales, atol=0), (
-            f"act_scales max diff: {(ref_scales - fused_scales).abs().max():.6e}"
+        assert torch.equal(ref_scales, fused_scales), (
+            "act_scales mismatch between reference and fused kernel"
         )
 
 
@@ -170,7 +170,7 @@ class TestOutputFormat:
         )
         assert out.dtype == torch.float32
         assert act_fp8.dtype == torch.float8_e4m3fn
-        assert act_scales.dtype == torch.float32
+        assert act_scales.dtype == torch.int8
 
 
 class TestInputDtypes:
@@ -401,7 +401,10 @@ class TestFusedActQuantSparsity:
         w_hi_fp8, w_hi_scales = block_quantize_fp8(w_hi, block_size=bs)  # type: ignore[reportPossiblyUnboundVariable]
 
         w_lo_fp8 = torch.zeros(N, K, device=DEVICE, dtype=torch.float8_e4m3fn)
-        w_lo_scales = torch.zeros(K // bs, N, device=DEVICE)  # sentinel
+        # int8 -128 sentinel: exp2(-128) → 0.0 in GEMM kernel
+        w_lo_scales = torch.full(
+            (K // bs, N), -128, device=DEVICE, dtype=torch.int8,
+        )
 
         out, _, _ = fused_act_quant_dual_gemm_forward(  # type: ignore[reportPossiblyUnboundVariable]
             act, w_hi_fp8, w_lo_fp8, w_hi_scales, w_lo_scales,
@@ -412,9 +415,9 @@ class TestFusedActQuantSparsity:
         act_fp8, act_scales = block_quantize_fp8(act, block_size=bs)  # type: ignore[reportPossiblyUnboundVariable]
         num_kb = K // bs
         a_blocked = act_fp8.float().reshape(M, num_kb, bs)
-        a_deq = (a_blocked * act_scales.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_blocked * torch.exp2(act_scales.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blocked = w_hi_fp8.float().reshape(N, num_kb, bs)
-        bhi_deq = (bhi_blocked * w_hi_scales.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blocked * torch.exp2(w_hi_scales.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ bhi_deq.t()
 
         assert torch.allclose(out, ref, atol=1e-2)
@@ -502,3 +505,83 @@ class TestPersistentActQuant:
         assert torch.allclose(out_p, out_np, atol=1e-6)
         assert torch.equal(fp8_p, fp8_np)
         assert torch.equal(sc_p, sc_np)
+
+
+# ── Test: Side-Output Elision ───────────────────────────────────────────
+
+
+class TestSideOutputElision:
+    """Verify save_side_outputs=False elides side-output stores."""
+
+    @requires_triton
+    def test_no_side_outputs_returns_none(self) -> None:
+        """save_side_outputs=False returns (output, None, None)."""
+        M, N, K, bs = 128, 128, 256, 128
+        act, w_hi, w_lo, s_hi, s_lo = _make_test_data(M, N, K, bs)
+
+        out, fp8, scales = fused_act_quant_dual_gemm_forward(  # type: ignore[reportPossiblyUnboundVariable]
+            act, w_hi, w_lo, s_hi, s_lo,
+            block_size=bs, save_side_outputs=False,
+        )
+
+        assert out.shape == (M, N)
+        assert out.dtype == torch.float32
+        assert fp8 is None
+        assert scales is None
+
+    @requires_triton
+    def test_output_identical_with_and_without(self) -> None:
+        """GEMM output is bitwise identical regardless of elision."""
+        M, N, K, bs = 128, 256, 256, 128
+        act, w_hi, w_lo, s_hi, s_lo = _make_test_data(M, N, K, bs)
+
+        out_full, _, _ = fused_act_quant_dual_gemm_forward(  # type: ignore[reportPossiblyUnboundVariable]
+            act, w_hi, w_lo, s_hi, s_lo,
+            block_size=bs, save_side_outputs=True,
+        )
+        out_elided, _, _ = fused_act_quant_dual_gemm_forward(  # type: ignore[reportPossiblyUnboundVariable]
+            act, w_hi, w_lo, s_hi, s_lo,
+            block_size=bs, save_side_outputs=False,
+        )
+
+        assert torch.allclose(out_full, out_elided, atol=1e-6)
+
+    @requires_triton
+    def test_training_convergence_hp_grad_weight(self) -> None:
+        """Training with hp_grad_weight=True converges (exercises elision)."""
+        from tcfp.nn import TCFPLinear
+
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            TCFPLinear(
+                256, 128, mode=TCFPMode.TCFP12,
+                use_tensor_cores=True, scale_block_size=128,
+                hp_grad_weight=True,
+            ),
+            nn.ReLU(),
+            TCFPLinear(
+                128, 64, mode=TCFPMode.TCFP12,
+                use_tensor_cores=True, scale_block_size=64,
+                hp_grad_weight=True,
+            ),
+        ).to(DEVICE)
+
+        x = torch.randn(8, 256, device=DEVICE)
+        target = torch.randn(8, 64, device=DEVICE)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        criterion = nn.MSELoss()
+
+        initial_loss = None
+        for step in range(30):
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, target)
+            if step == 0:
+                initial_loss = loss.item()
+            loss.backward()
+            optimizer.step()
+
+        final_loss = loss.item()  # pyright: ignore[reportPossiblyUnboundVariable]
+        assert final_loss < initial_loss * 0.8, (  # type: ignore[operator]
+            f"Loss didn't decrease: {initial_loss:.4f} -> {final_loss:.4f}"
+        )

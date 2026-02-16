@@ -167,8 +167,8 @@ class TestOutputFormat:
         w_hi, w_lo, sh, sl = fused_dual_quantize_fp8(w, block_size=128)  # type: ignore[reportPossiblyUnboundVariable]
         assert w_hi.dtype == torch.float8_e4m3fn
         assert w_lo.dtype == torch.float8_e4m3fn
-        assert sh.dtype == torch.float32
-        assert sl.dtype == torch.float32
+        assert sh.dtype == torch.int8
+        assert sl.dtype == torch.int8
 
     @pytest.mark.parametrize("block_size", [64, 128])
     def test_scales_shape(self, block_size: int) -> None:
@@ -179,17 +179,20 @@ class TestOutputFormat:
         assert sh.shape == expected
         assert sl.shape == expected
 
-    def test_scales_are_power_of_2(self) -> None:
-        """All scales must be exact powers of 2."""
+    def test_scales_are_int8_exponents(self) -> None:
+        """All scales must be int8 exponents (E8M0 encoding)."""
         torch.manual_seed(42)
         w = torch.randn(128, 256, device=DEVICE) * 10
         _, _, sh, sl = fused_dual_quantize_fp8(w, block_size=128)  # type: ignore[reportPossiblyUnboundVariable]
 
-        for name, scales in [("hi", sh), ("lo", sl)]:
-            log2_s = torch.log2(scales)
-            assert torch.allclose(log2_s, log2_s.round(), atol=1e-6), (
-                f"scales_{name} not power-of-2"
-            )
+        assert sh.dtype == torch.int8
+        assert sl.dtype == torch.int8
+        # hi exponents clamped to >= -126
+        assert (sh >= -126).all(), "scales_hi exponents out of range"
+        # lo allows -128 sentinel for zero-residual blocks
+        assert ((sl >= -126) | (sl == -128)).all(), (
+            "scales_lo exponents out of range"
+        )
 
     def test_all_finite(self) -> None:
         torch.manual_seed(123)
@@ -197,8 +200,9 @@ class TestOutputFormat:
         w_hi, w_lo, sh, sl = fused_dual_quantize_fp8(w, block_size=128)  # type: ignore[reportPossiblyUnboundVariable]
         assert torch.isfinite(w_hi.float()).all()
         assert torch.isfinite(w_lo.float()).all()
-        assert torch.isfinite(sh).all()
-        assert torch.isfinite(sl).all()
+        # int8 exponents are always finite (no NaN/Inf possible)
+        assert sh.dtype == torch.int8
+        assert sl.dtype == torch.int8
 
     def test_bf16_input(self) -> None:
         """BF16 weight is handled correctly (cast to FP32 inside kernel)."""

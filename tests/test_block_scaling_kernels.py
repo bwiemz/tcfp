@@ -53,18 +53,8 @@ def _reference_block_scaled_gemm(
     block_size: int,
 ) -> torch.Tensor:
     """Reference: dequantize per-block then FP32 matmul."""
-    M, K = a_fp8.shape
-    N = b_fp8.shape[0]
-    num_kb = K // block_size
-
-    # Dequantize A per-block — scales are (num_kb, M), .t() → (M, num_kb)
-    a_blocked = a_fp8.float().reshape(M, num_kb, block_size)
-    a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
-
-    # Dequantize B per-block — scales are (num_kb, N), .t() → (N, num_kb)
-    b_blocked = b_fp8.float().reshape(N, num_kb, block_size)
-    b_deq = (b_blocked * sb.t().unsqueeze(-1)).reshape(N, K)
-
+    a_deq = block_dequantize_fp8(a_fp8, sa, block_size)  # type: ignore[reportPossiblyUnboundVariable]
+    b_deq = block_dequantize_fp8(b_fp8, sb, block_size)  # type: ignore[reportPossiblyUnboundVariable]
     return a_deq @ b_deq.t()
 
 
@@ -96,7 +86,7 @@ class TestBlockQuantize:
         x = torch.randn(64, 128, device=DEVICE)
         fp8, scales = block_quantize_fp8(x, block_size=32)  # type: ignore[reportPossiblyUnboundVariable]
         assert fp8.dtype == torch.float8_e4m3fn
-        assert scales.dtype == torch.float32
+        assert scales.dtype == torch.int8
 
     @requires_triton
     def test_e5m2_dtype(self) -> None:
@@ -107,12 +97,12 @@ class TestBlockQuantize:
         assert fp8.dtype == torch.float8_e5m2
 
     @requires_triton
-    def test_scales_are_power_of_2(self) -> None:
+    def test_scales_are_int8_exponents(self) -> None:
         x = torch.randn(64, 128, device=DEVICE) * 10
         _, scales = block_quantize_fp8(x, block_size=32)  # type: ignore[reportPossiblyUnboundVariable]
-        log2_scales = torch.log2(scales)
-        # Power-of-2 means log2 is integer
-        assert torch.allclose(log2_scales, log2_scales.round(), atol=1e-6)
+        assert scales.dtype == torch.int8
+        # Exponents clamped to >= -126 in kernel
+        assert (scales >= -126).all()
 
     @requires_triton
     def test_roundtrip_quality(self) -> None:
@@ -195,17 +185,18 @@ class TestBlockScaledGemm:
 
     @requires_triton
     def test_identity_scales(self) -> None:
-        """When all scales are 1.0, should match per-tensor FP8 result."""
+        """When all exponents are 0 (scale=1.0), should match per-tensor FP8."""
         M, K, N = 64, 64, 64
         a = torch.randn(M, K, device=DEVICE)
         b = torch.randn(N, K, device=DEVICE)
         a_fp8 = a.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
         b_fp8 = b.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
-        ones_a = torch.ones(M, K // 32, device=DEVICE)
-        ones_b = torch.ones(N, K // 32, device=DEVICE)
+        # int8 exponent 0 → exp2(0) = 1.0 (identity scale)
+        zero_a = torch.zeros(K // 32, M, device=DEVICE, dtype=torch.int8)
+        zero_b = torch.zeros(K // 32, N, device=DEVICE, dtype=torch.int8)
 
-        result = block_scaled_gemm(a_fp8, b_fp8, ones_a, ones_b, block_size=32)  # type: ignore[reportPossiblyUnboundVariable]
+        result = block_scaled_gemm(a_fp8, b_fp8, zero_a, zero_b, block_size=32)  # type: ignore[reportPossiblyUnboundVariable]
         ref = a_fp8.float() @ b_fp8.float().t()
 
         assert torch.allclose(result, ref, atol=1e-3)
@@ -535,14 +526,17 @@ class TestSparsityFastPath:
 
     @requires_triton
     def test_zero_lo_sparse_skip(self) -> None:
-        """All-zero W_lo (scale=0.0) should match W_hi-only reference."""
+        """All-zero W_lo (exp=-128 sentinel) matches W_hi-only reference."""
         M, K, N = 64, 128, 64
         bs = 32
 
         a_fp8, sa = _make_block_quantized(M, K, bs)
         bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
         blo_fp8 = torch.zeros(N, K, device=DEVICE, dtype=torch.float8_e4m3fn)
-        sblo = torch.zeros(K // bs, N, device=DEVICE)  # sentinel=0.0
+        # int8 -128 sentinel: exp2(-128) → 0.0 in GEMM kernel
+        sblo = torch.full(
+            (K // bs, N), -128, device=DEVICE, dtype=torch.int8,
+        )
 
         result = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
             a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
@@ -562,10 +556,10 @@ class TestSparsityFastPath:
         bhi_fp8, sbhi = _make_block_quantized(N, K, bs)
         blo_fp8, sblo = _make_block_quantized(N, K, bs)
 
-        # Zero out odd K-blocks in W_lo (set scale=0.0)
+        # Zero out odd K-blocks in W_lo (set exp=-128 sentinel)
         for kb in range(num_kb):
             if kb % 2 == 1:
-                sblo[kb, :] = 0.0
+                sblo[kb, :] = -128
 
         result_sparse = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
             a_fp8, bhi_fp8, blo_fp8, sa, sbhi, sblo,
@@ -575,11 +569,11 @@ class TestSparsityFastPath:
         # Reference: manual dequant with the same zero-scale pattern
         num_blocks = K // bs
         a_blocked = a_fp8.float().reshape(M, num_blocks, bs)
-        a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_blocked * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blocked = bhi_fp8.float().reshape(N, num_blocks, bs)
-        bhi_deq = (bhi_blocked * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blocked * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blocked = blo_fp8.float().reshape(N, num_blocks, bs)
-        blo_deq = (blo_blocked * sblo.t().unsqueeze(-1)).reshape(N, K)
+        blo_deq = (blo_blocked * torch.exp2(sblo.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ (bhi_deq + blo_deq).t()
 
         assert torch.allclose(result_sparse, ref, atol=1e-2)
@@ -604,11 +598,11 @@ class TestSparsityFastPath:
         # Reference with full dequant
         num_blocks = K // bs
         a_blocked = a_fp8.float().reshape(M, num_blocks, bs)
-        a_deq = (a_blocked * sa.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_blocked * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blocked = bhi_fp8.float().reshape(N, num_blocks, bs)
-        bhi_deq = (bhi_blocked * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blocked * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blocked = blo_fp8.float().reshape(N, num_blocks, bs)
-        blo_deq = (blo_blocked * sblo.t().unsqueeze(-1)).reshape(N, K)
+        blo_deq = (blo_blocked * torch.exp2(sblo.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ (bhi_deq + blo_deq).t()
 
         assert torch.allclose(result, ref, atol=1e-2)
@@ -637,11 +631,11 @@ class TestPersistentKernel:
 
         # Reference with full dequant
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
-        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
-        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        blo_deq = (blo_blk * torch.exp2(sblo.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ (bhi_deq + blo_deq).t()
 
         assert torch.allclose(result, ref, atol=1e-2)
@@ -662,11 +656,11 @@ class TestPersistentKernel:
         )
 
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
-        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
-        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        blo_deq = (blo_blk * torch.exp2(sblo.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ (bhi_deq + blo_deq).t()
 
         assert torch.allclose(result, ref, atol=1e-2)
@@ -687,11 +681,11 @@ class TestPersistentKernel:
         )
 
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * sa.t().unsqueeze(-1)).reshape(M, K)
+        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
-        bhi_deq = (bhi_blk * sbhi.t().unsqueeze(-1)).reshape(N, K)
+        bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
-        blo_deq = (blo_blk * sblo.t().unsqueeze(-1)).reshape(N, K)
+        blo_deq = (blo_blk * torch.exp2(sblo.float()).t().unsqueeze(-1)).reshape(N, K)
         ref = a_deq @ (bhi_deq + blo_deq).t()
 
         assert torch.allclose(result, ref, atol=1e-2)

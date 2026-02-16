@@ -109,6 +109,8 @@ NVIDIA TE is the current industry standard for FP8 training:
 | **Maturity** | Production (H100/B200) | Research prototype |
 | **Speed** | Faster (1 GEMM) | Slower (2 GEMMs per layer) |
 | **Weight VRAM** | 8 bits | 12.5 bits |
+| **Scale storage** | FP32 per-tensor or per-block | Int8 exponents (E8M0, 4x smaller) |
+| **Bandwidth opts** | N/A (single GEMM) | Side-output elision, E8M0, sparsity fast-path |
 
 **Key insight**: TE's single FP8 GEMM works for production LLM training but requires careful per-layer configuration — many layers fall back to BF16 when FP8 precision is insufficient. TCFP-12 eliminates this complexity by providing enough precision to train all layers in FP8.
 
@@ -127,7 +129,7 @@ NVIDIA TE is the current industry standard for FP8 training:
 | **Quality** | Baseline | **Matches exactly** (ppl ratio 1.002x) |
 | **Weight VRAM** | 13.0 GB (7B) | **10.2 GB (7B)** — 22% savings |
 | **Tensor cores used** | BF16 cores | FP8 cores (2x FLOPS available) |
-| **Speed** | Baseline | Currently 1.8x slower (quantization overhead; raw GEMMs are 1.9x faster) |
+| **Speed** | Baseline | Currently 1.8x slower (quantization overhead; raw GEMMs are 1.9x faster). Bandwidth optimizations (side-output elision, E8M0 scales, sparsity fast-path) reduce overhead incrementally; fusing quantization into GEMM is the path to parity |
 | **Maturity** | Production standard | Research prototype |
 
 ## When to Use TCFP-12
@@ -165,9 +167,13 @@ TCFP-12 moves less data than BF16 (12.5 bits vs 16 bits) and raw FP8 GEMMs are 1
 
 4. **Persistent tiling** — *(Done)* Both dual-GEMM Triton kernels use persistent tiling: each CTA loops over multiple output tiles to eliminate wave quantization (last-wave SM underutilization). Controlled via `persistent=True` (default) and `launch_mult` (CTAs per SM). When the tile count doesn't divide evenly by SM count, persistent tiling keeps all SMs busy.
 
-5. **Residual sparsity fast-path** — *(Done)* K-blocks where `max(scale_lo) <= threshold` skip the W_lo tile load and dot product entirely. Combined with the zero-residual sentinel (`inv_scale=0.0`), sparse residual blocks are detected and skipped at near-zero cost (~5-cycle warp reduction).
+5. **Residual sparsity fast-path** — *(Done)* K-blocks where `max(scale_lo) <= threshold` skip the W_lo tile load and dot product entirely. Combined with the zero-residual sentinel (int8 -128), sparse residual blocks are detected and skipped at near-zero cost (~5-cycle warp reduction).
 
-6. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
+6. **Side-output elision** — *(Done)* When `hp_grad_weight=True`, the fused act-quant kernel's `act_fp8` and `act_scales` stores are dead writes (backward uses FP32 input instead). `SAVE_SIDE_OUTPUTS: tl.constexpr` eliminates all side-output stores at compile time, saving 8.25 MB per forward pass (6.9% of total bandwidth).
+
+7. **Int8 exponent encoding (E8M0)** — *(Done)* Per-block scales stored as int8 exponents instead of FP32 (4x smaller). Producers store `raw_exp.to(tl.int8)`, consumers reconstruct via `tl.exp2()`. Zero-residual sentinel uses int8 -128.
+
+8. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
 
 ### Pillar 2: Distributed Training (FSDP / Multi-GPU)
 
@@ -257,13 +263,27 @@ Controlled via `persistent` (bool, default `True`) and `launch_mult` (int, defau
 
 ### Residual Sparsity Fast-Path
 
-When a K-block's residual is near-zero (`max(scale_lo) <= threshold`), the W_lo tile load and dot product are skipped entirely. Combined with the zero-residual sentinel (`inv_scale=0.0` for zero blocks), sparse residuals are detected via a ~5-cycle warp reduction and skipped at near-zero overhead:
+When a K-block's residual is near-zero (`max(scale_lo) <= threshold`), the W_lo tile load and dot product are skipped entirely. Combined with the zero-residual sentinel (int8 exponent -128 for zero blocks), sparse residuals are detected via a ~5-cycle warp reduction and skipped at near-zero overhead:
 
 ```python
 # Sparsity threshold can be tuned per-model
 fused_block_scaled_dual_gemm_forward(
     ..., sparse_threshold=1e-6,
 )
+```
+
+### Side-Output Elision
+
+When `hp_grad_weight=True` (the default for training quality), the fused act-quant kernel's side outputs (`act_fp8` and `act_scales`) are never read by backward — backward uses the original FP32 input instead. The kernel uses `SAVE_SIDE_OUTPUTS: tl.constexpr` to physically eliminate all side-output stores from the compiled kernel, saving **8.25 MB of VRAM write bandwidth per forward pass** (6.9% of total) for a typical 2048x4096 layer. This is automatic — no user configuration needed.
+
+### Int8 Exponent Encoding (E8M0)
+
+All per-block FP8 scales are stored as int8 exponents instead of FP32. Since TCFP scales are always power-of-2 (`scale = 2^ceil(log2(amax / FP8_MAX))`), storing the integer exponent directly eliminates 3 wasted bytes per scale — a **4x reduction** in scale storage. Consumer GEMM kernels reconstruct via `tl.exp2()` (single instruction, negligible overhead). Zero-residual blocks use int8 sentinel value -128, restored to exact 0.0 in consumers for the sparsity fast-path.
+
+```python
+# Automatic — scales are always int8 in the block-scaled path
+w_hi, w_lo, scales_hi, scales_lo = fused_dual_quantize_fp8(weight, block_size=128)
+# scales_hi.dtype == torch.int8, scales_lo.dtype == torch.int8
 ```
 
 ### Fused Dual Quantization
@@ -363,9 +383,11 @@ x_recovered = dequantize_tcfp12(tcfp12)
 - Fused dual quantization kernel reduces block-scaled forward from ~15 kernels to ~4
 - Persistent tiling eliminates wave quantization for large problems
 - Residual sparsity fast-path skips zero W_lo blocks at near-zero cost
+- Side-output elision saves 8.25 MB/forward (6.9% bandwidth) when `hp_grad_weight=True`
+- Int8 exponent encoding (E8M0) reduces scale storage 4x — all per-block scales use int8
 
 **Current limitations:**
-- **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Fused dual quantization reduces this overhead; fusing quantization into the GEMM itself is the path to >1.0x
+- **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Bandwidth optimizations (side-output elision saves 6.9%, E8M0 scales save 0.8%) chip away at overhead; fusing quantization into the GEMM itself is the path to >1.0x
 - **Single-GPU only**: Not validated with distributed training (FSDP, TP, PP) — the primary blocker for real-world adoption
 - **No framework integration**: Requires manual `convert_to_tcfp()` call, no HuggingFace/DeepSpeed drop-in support yet
 - **Partial kernel fusion**: cuBLASLt fuses forward GEMMs but backward still dispatches separately (E5M2 limitation)
@@ -380,7 +402,8 @@ tcfp/
 │                          error feedback with PDDS delayed scaling
 │   ├── kernels.py       # Triton kernels: fused dual-GEMM, block-scaled GEMM,
 │                          block quantization, fused dual quantization,
-│                          persistent tiling, residual sparsity
+│                          persistent tiling, residual sparsity,
+│                          side-output elision, int8 exponent encoding
 │   ├── cuda_ext.py      # cuBLASLt C++ extension JIT loader + Python wrapper
 │   ├── csrc/            # C++ source: fused dual FP8 GEMM via cuBLASLt
 │   │                      beta=1 accumulation (fused_dual_gemm.h/.cu/_bind.cpp)
@@ -389,9 +412,10 @@ tcfp/
 │                          _TCFP12TensorCoreFunction (2-GEMM residual),
 │                          _TCFP12BlockScaledFunction (per-block),
 │                          and PDDS delayed scaling helpers
-├── tests/               # 273 tests covering all modes + tensor core paths
+├── tests/               # 276 tests covering all modes + tensor core paths
 │                          + delayed scaling + block scaling + cuBLASLt ext
 │                          + persistent tiling + residual sparsity
+│                          + side-output elision + int8 exponent encoding
 ├── benchmarks/          # Quality + throughput + TC GEMM + block GEMM benchmarks
 ├── examples/            # Training convergence tests (MNIST + TinyGPT)
 └── pyproject.toml
