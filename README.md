@@ -131,7 +131,7 @@ NVIDIA TE is the current industry standard for FP8 training:
 | **Quality** | Baseline | **Matches exactly** (ppl ratio 1.002x) |
 | **Weight VRAM** | 13.0 GB (7B) | **10.2 GB (7B)** — 22% savings |
 | **Tensor cores used** | BF16 cores | FP8 cores (2x FLOPS available) |
-| **Speed** | Baseline | Currently 1.8x slower (unfused) |
+| **Speed** | Baseline | Currently 1.8x slower (quantization overhead; raw GEMMs are 1.9x faster) |
 | **Maturity** | Production standard | Research prototype |
 
 ## When to Use TCFP-12
@@ -149,25 +149,43 @@ NVIDIA TE is the current industry standard for FP8 training:
 - You need guaranteed convergence parity with BF16
 
 **Not yet suitable for:**
-- Production data-centre deployment (single-GPU only, no fused kernels)
-- Latency-sensitive inference (quantization overhead)
+- Multi-GPU / distributed training (single-GPU only, FSDP not yet validated)
+- Production data-centre deployment (needs framework integration + scale validation)
 - Models where single FP8 already converges well (simple CNNs, MLPs)
 
-## What's Needed for Production Viability
+## Roadmap to Production
 
-TCFP-12 TC is a research prototype. To become a viable replacement for the current standard:
+TCFP-12 TC is a research prototype. Three pillars define "production-ready":
 
-1. **Fused CUDA kernels** — *(Partially done)* The cuBLASLt C++ extension fuses the two forward GEMMs via beta=1 accumulation, eliminating the intermediate FP32 buffer and addition kernel. The backward pass still uses two separate dispatches because cuBLASLt doesn't support E5M2 as A-type on SM 12.0+ (Blackwell). A fully fused kernel (forward + backward) sharing activation reads in shared memory could further halve memory bandwidth.
+### Pillar 1: Speed-of-Light Kernel (Target: >1.0x vs BF16)
 
-2. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Native CUDA kernels or compiler-level fusion could close this gap. Per-block scaling provides better dynamic range for outlier-heavy distributions common in real LLMs.
+TCFP-12 moves less data than BF16 (12.5 bits vs 16 bits) and raw FP8 GEMMs are 1.9x faster. The physics says we should be *faster* than BF16 — the current 1.8x slowdown comes from quantization overhead, not the GEMMs themselves. The path to closing this gap:
 
-3. **Distributed training integration** — Multi-GPU training (FSDP, tensor parallelism, pipeline parallelism) needs validation. The 2-GEMM decomposition and error feedback state must be correctly sharded, synchronized, and checkpointed across ranks.
+1. **Fuse quantization + GEMM** — The biggest overhead is quantizing W to FP8, computing the residual, and quantizing W_lo *before* each forward pass. Fusing quantization into the GEMM launch (quantize tiles on-the-fly as they're loaded from GMEM into SMEM) would eliminate the separate quantization kernels entirely. This is the single highest-impact optimization.
 
-4. **Large-scale convergence validation** — TinyGPT (4-layer, d=256, 1000 steps) proves the approach works. Production adoption requires convergence parity at 7B-70B scale over thousands of steps, across architectures (LLaMA, Mistral, GPT-style) and training regimes (pre-training, fine-tuning, RLHF).
+2. **Fused dual-GEMM backward** — *(Forward done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. The backward pass still uses two separate dispatches (cuBLASLt doesn't support E5M2 as A-type on SM 12.0+). A Triton kernel that fuses both backward dX GEMMs — loading grad once, computing `grad @ W_hi` and `grad @ W_lo`, adding in registers — would halve backward memory bandwidth. Triton bypasses the cuBLASLt E5M2 limitation since it generates PTX directly.
 
-5. **Framework integration** — Drop-in support for Megatron-LM, DeepSpeed, or HuggingFace Trainer. Currently TCFP is a standalone `convert_to_tcfp()` wrapper; production systems need hooks for gradient checkpointing, mixed-precision policies, and optimizer state management.
+3. **Optimized per-block scaling** — The Triton block-scaled kernels work but add ~40% overhead over per-tensor `_scaled_mm`. Fusing block quantization into the GEMM kernel (compute per-block scales as tiles are loaded) could close this gap while providing better dynamic range for outlier-heavy distributions.
 
-6. **Hardware-specific tuning** — Benchmarks are on RTX 5070 Ti (consumer Blackwell). H100/B200 data-centre GPUs have different FP8 tensor core architectures, memory hierarchies, and inter-GPU bandwidth. Performance characteristics may differ significantly.
+### Pillar 2: Distributed Training (FSDP / Multi-GPU)
+
+The primary user for TCFP is VRAM-constrained. These users almost always use FSDP or DeepSpeed ZeRO to shard across consumer GPUs (e.g., 2x RTX 4090s). Without multi-GPU support, TCFP can't serve its core audience at scale.
+
+1. **FSDP compatibility** — Ensure FSDP correctly shards TCFPLinear parameters without casting FP8 components back to FP32 or breaking the 2-GEMM layout. Error feedback state must be correctly sharded and synchronized across ranks.
+
+2. **Tensor/pipeline parallelism** — Validate that the 2-GEMM decomposition works correctly when layers are split across devices. Checkpoint/resume must preserve error feedback and delayed scaling state.
+
+3. **Large-scale convergence validation** — TinyGPT (4-layer, d=256, 1000 steps) proves the approach works. Production adoption requires convergence parity at 7B+ scale over thousands of steps, across architectures (LLaMA, Mistral, GPT-style) and training regimes (pre-training, fine-tuning, RLHF).
+
+### Pillar 3: Drop-in Framework Integration
+
+If users have to manually rewrite model definitions, adoption drops 90%. The goal is 3 lines of code added to an existing training script.
+
+1. **HuggingFace integration** — A `TrainerCallback` or `quantization_config=TcfpConfig()` pattern that auto-converts models at load time. Users should be able to add TCFP to any HF training script without touching model code.
+
+2. **Megatron-LM / DeepSpeed hooks** — Drop-in support for production training frameworks. Needs hooks for gradient checkpointing, mixed-precision policies, and optimizer state management.
+
+3. **Hardware-specific tuning** — Benchmarks are on RTX 5070 Ti (consumer Blackwell). H100/B200 data-centre GPUs have different FP8 tensor core architectures, memory hierarchies, and inter-GPU bandwidth. Performance characteristics may differ significantly.
 
 ## Features
 
@@ -306,11 +324,11 @@ x_recovered = dequantize_tcfp16(tcfp16)
 - cuBLASLt C++ extension fuses forward GEMMs via beta=1 accumulation (no intermediate buffer)
 
 **Current limitations:**
-- **1.8x slower than BF16** in training step throughput (unfused 2-GEMM overhead)
-- **Per-tensor scaling only** on the `_scaled_mm` path (Triton block-scaled path adds ~40% overhead)
-- **Single-GPU only**: Not validated with distributed training strategies (FSDP, TP, PP)
+- **1.8x slower than BF16** in training step throughput — raw FP8 GEMMs are 1.9x faster, but quantization overhead (W decomposition + FP8 casting each step) eats the gain. Fusing quantization into the GEMM is the path to >1.0x
+- **Single-GPU only**: Not validated with distributed training (FSDP, TP, PP) — the primary blocker for real-world adoption
+- **No framework integration**: Requires manual `convert_to_tcfp()` call, no HuggingFace/DeepSpeed drop-in support yet
 - **Partial kernel fusion**: cuBLASLt fuses forward GEMMs but backward still dispatches separately (E5M2 limitation)
-- **Research prototype**: Not battle-tested at production scale
+- **Research prototype**: Validated at TinyGPT scale (4-layer, d=256), not yet at 7B+
 
 ## Project Structure
 
