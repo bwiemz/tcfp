@@ -631,7 +631,8 @@ class TestPersistentKernel:
 
         # Reference with full dequant
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
+        a_blk = a_fp8.float().reshape(M, num_blocks, bs)
+        a_deq = (a_blk * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
         bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
@@ -656,7 +657,8 @@ class TestPersistentKernel:
         )
 
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
+        a_blk = a_fp8.float().reshape(M, num_blocks, bs)
+        a_deq = (a_blk * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
         bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
@@ -681,7 +683,8 @@ class TestPersistentKernel:
         )
 
         num_blocks = K // bs
-        a_deq = (a_fp8.float().reshape(M, num_blocks, bs) * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
+        a_blk = a_fp8.float().reshape(M, num_blocks, bs)
+        a_deq = (a_blk * torch.exp2(sa.float()).t().unsqueeze(-1)).reshape(M, K)
         bhi_blk = bhi_fp8.float().reshape(N, num_blocks, bs)
         bhi_deq = (bhi_blk * torch.exp2(sbhi.float()).t().unsqueeze(-1)).reshape(N, K)
         blo_blk = blo_fp8.float().reshape(N, num_blocks, bs)
@@ -710,3 +713,204 @@ class TestPersistentKernel:
         )
 
         assert torch.allclose(result_persistent, result_non_persistent, atol=1e-6)
+
+
+# ── ABD (Asymmetric Backward Decomposition) ────────────────────────────
+
+
+class TestABD:
+    """Tests for ABD with block-scaled path."""
+
+    @requires_triton
+    def test_abd_forward_unchanged(self) -> None:
+        """ABD=True produces identical forward output to ABD=False."""
+        from tcfp.nn import TCFPLinear
+
+        torch.manual_seed(42)
+        layer_std = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=False,
+            scale_block_size=32,
+        ).to(DEVICE)
+        layer_abd = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=False,
+            scale_block_size=32, abd=True,
+        ).to(DEVICE)
+        layer_abd.weight = layer_std.weight
+        layer_abd.bias = layer_std.bias
+
+        x = torch.randn(8, 128, device=DEVICE)
+        out_std = layer_std(x)
+        out_abd = layer_abd(x)
+        assert torch.equal(out_std, out_abd), "ABD should not affect forward"
+
+    @requires_triton
+    def test_abd_backward_shapes(self) -> None:
+        """Gradients have correct shapes with ABD + block scaling."""
+        from tcfp.nn import TCFPLinear
+
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, scale_block_size=32, abd=True,
+        ).to(DEVICE)
+        x = torch.randn(8, 128, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert x.grad.shape == (8, 128)
+        assert layer.weight.grad is not None
+        assert layer.weight.grad.shape == (64, 128)
+
+    @requires_triton
+    def test_abd_convergence(self) -> None:
+        """Training loss decreases with ABD + block scaling."""
+        from tcfp.nn import TCFPLinear
+
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            TCFPLinear(
+                128, 64, use_tensor_cores=True,
+                scale_block_size=32, abd=True,
+            ),
+            torch.nn.ReLU(),
+            TCFPLinear(
+                64, 32, use_tensor_cores=True,
+                scale_block_size=32, abd=True,
+            ),
+        ).to(DEVICE)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x = torch.randn(32, 128, device=DEVICE)
+        target = torch.randn(32, 32, device=DEVICE)
+
+        losses: list[float] = []
+        for _step in range(50):
+            opt.zero_grad()
+            out = model(x)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"ABD loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        )
+
+    @requires_triton
+    def test_abd_convert_to_tcfp(self) -> None:
+        """convert_to_tcfp(abd=True) propagates to all TCFPLinear layers."""
+        from tcfp.nn import TCFPLinear, convert_to_tcfp
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 32),
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model, skip_patterns=(),
+            use_tensor_cores=True, scale_block_size=32, abd=True,
+        )
+        for module in model.modules():
+            if isinstance(module, TCFPLinear):
+                assert module.abd is True
+
+
+# ── SRR (Stochastic Residual Rounding) ──────────────────────────────────
+
+
+class TestSRR:
+    """Tests for SRR with block-scaled path."""
+
+    @requires_triton
+    def test_srr_forward_runs(self) -> None:
+        """SRR block-scaled forward produces correct output shape."""
+        from tcfp.nn import TCFPLinear
+
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True,
+            scale_block_size=32, srr=True,
+        ).to(DEVICE)
+        x = torch.randn(8, 128, device=DEVICE)
+        out = layer(x)
+        assert out.shape == (8, 64)
+        assert torch.isfinite(out).all()
+
+    @requires_triton
+    def test_srr_no_error_state(self) -> None:
+        """SRR disables error feedback buffer."""
+        from tcfp.nn import TCFPLinear
+
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True,
+            scale_block_size=32, srr=True,
+        )
+        assert layer._error_state is None
+
+    @requires_triton
+    def test_srr_backward_finite(self) -> None:
+        """Gradients are finite with block-scaled SRR."""
+        from tcfp.nn import TCFPLinear
+
+        layer = TCFPLinear(
+            128, 64, bias=True, use_tensor_cores=True,
+            scale_block_size=32, srr=True,
+        ).to(DEVICE)
+        x = torch.randn(8, 128, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+        assert layer.weight.grad is not None
+        assert torch.isfinite(layer.weight.grad).all()
+
+    @requires_triton
+    def test_srr_convergence(self) -> None:
+        """Training loss decreases with block-scaled SRR."""
+        from tcfp.nn import TCFPLinear
+
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            TCFPLinear(
+                128, 64, use_tensor_cores=True,
+                scale_block_size=32, srr=True,
+            ),
+            torch.nn.ReLU(),
+            TCFPLinear(
+                64, 32, use_tensor_cores=True,
+                scale_block_size=32, srr=True,
+            ),
+        ).to(DEVICE)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x = torch.randn(32, 128, device=DEVICE)
+        target = torch.randn(32, 32, device=DEVICE)
+
+        losses: list[float] = []
+        for _step in range(50):
+            opt.zero_grad()
+            out = model(x)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"SRR loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        )
+
+    @requires_triton
+    def test_srr_convert_to_tcfp(self) -> None:
+        """convert_to_tcfp(srr=True) propagates to all TCFPLinear layers."""
+        from tcfp.nn import TCFPLinear, convert_to_tcfp
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 32),
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model, skip_patterns=(),
+            use_tensor_cores=True, scale_block_size=32, srr=True,
+        )
+        for module in model.modules():
+            if isinstance(module, TCFPLinear):
+                assert module.srr is True
+                assert module._error_state is None

@@ -432,3 +432,95 @@ class TestIntegration:
         assert late < early, (
             f"Loss did not decrease: {early:.4f} -> {late:.4f}"
         )
+
+
+# ── Stochastic Lo (SRR kernel path) ─────────────────────────────────────
+
+
+@requires_triton
+class TestStochasticLo:
+    """Tests for stochastic rounding on W_lo in fused dual quantize."""
+
+    def test_stochastic_lo_error_buf_mutual_exclusion(self) -> None:
+        """stochastic_lo and error_buf cannot be used together."""
+        w = torch.randn(64, 128, device=DEVICE)
+        error_buf = torch.zeros(64, 128, device=DEVICE)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+                w, block_size=128, error_buf=error_buf, stochastic_lo=True,
+            )
+
+    def test_stochastic_lo_output_format(self) -> None:
+        """SR path produces correct dtypes and shapes."""
+        torch.manual_seed(42)
+        w = torch.randn(64, 128, device=DEVICE)
+        w_hi, w_lo, sh, sl = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=128, stochastic_lo=True,
+        )
+        assert w_hi.dtype == torch.float8_e4m3fn
+        assert w_lo.dtype == torch.float8_e4m3fn
+        assert w_hi.shape == (64, 128)
+        assert w_lo.shape == (64, 128)
+        assert sh.dtype == torch.int8
+        assert sl.dtype == torch.int8
+
+    def test_stochastic_lo_w_hi_unchanged(self) -> None:
+        """W_hi is identical whether stochastic_lo is True or False."""
+        torch.manual_seed(42)
+        w = torch.randn(64, 128, device=DEVICE)
+        hi_rtn, _, sh_rtn, _ = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=128, stochastic_lo=False,
+        )
+        hi_sr, _, sh_sr, _ = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=128, stochastic_lo=True,
+        )
+        assert torch.equal(hi_rtn, hi_sr), "W_hi should be identical"
+        assert torch.equal(sh_rtn, sh_sr), "W_hi scales should be identical"
+
+    def test_stochastic_lo_w_lo_differs(self) -> None:
+        """SR W_lo differs from RTN W_lo (stochastic noise)."""
+        torch.manual_seed(42)
+        w = torch.randn(128, 256, device=DEVICE)
+        _, lo_rtn, _, _ = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=128, stochastic_lo=False,
+        )
+        _, lo_sr, _, _ = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=128, stochastic_lo=True,
+        )
+        # At least some elements should differ due to stochastic rounding
+        diff_count = (lo_rtn.view(torch.int8) != lo_sr.view(torch.int8)).sum().item()
+        assert diff_count > 0, "SR should produce different W_lo than RTN"
+
+    def test_stochastic_lo_unbiased(self) -> None:
+        """Average SR quantization is close to true residual (unbiased)."""
+        torch.manual_seed(42)
+        N, K, bs = 64, 128, 128
+        w = torch.randn(N, K, device=DEVICE)
+
+        # Get true residual: weight - dequant(W_hi)
+        hi_rtn, _, sh_rtn, _ = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+            w, block_size=bs, stochastic_lo=False,
+        )
+        w_hi_deq = block_dequantize_fp8(hi_rtn, sh_rtn, bs)  # type: ignore[reportPossiblyUnboundVariable]
+        true_residual = w - w_hi_deq
+
+        # Average many SR runs
+        num_runs = 500
+        lo_sum = torch.zeros(N, K, device=DEVICE)
+        for _ in range(num_runs):
+            _, lo_sr, _, sl_sr = fused_dual_quantize_fp8(  # type: ignore[reportPossiblyUnboundVariable]
+                w, block_size=bs, stochastic_lo=True,
+            )
+            lo_deq = block_dequantize_fp8(lo_sr, sl_sr, bs)  # type: ignore[reportPossiblyUnboundVariable]
+            lo_sum += lo_deq
+        lo_avg = lo_sum / num_runs
+
+        # SR average should be close to true residual
+        abs_err = (lo_avg - true_residual).abs().mean().item()
+        residual_scale = true_residual.abs().mean().item()
+        # Relative bias should be small (< 10%)
+        if residual_scale > 1e-6:
+            relative_bias = abs_err / residual_scale
+            assert relative_bias < 0.10, (
+                f"SR bias too large: {relative_bias:.4f} (abs_err={abs_err:.6f})"
+            )

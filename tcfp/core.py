@@ -106,6 +106,34 @@ def to_fp8_e4m3(
     return fp8, inv_scale
 
 
+def to_fp8_e4m3_sr(
+    tensor: torch.Tensor,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cast a tensor to FP8 E4M3 with stochastic rounding (SR).
+
+    Identical to :func:`to_fp8_e4m3` but uses stochastic rounding instead
+    of round-to-nearest.  ``E[dequant(quant(x))] = x`` (unbiased per-step),
+    suitable for W_lo in SRR mode.
+
+    Args:
+        tensor: Input tensor (any float dtype).
+        scale: Optional pre-computed scale. If None, computed from tensor max.
+
+    Returns:
+        (fp8_tensor, inv_scale): The FP8 tensor and the inverse scale.
+    """
+    if scale is None:
+        amax = tensor.abs().max().clamp(min=1e-12)
+        scale = (FP8_E4M3_MAX / amax).to(torch.float32)
+
+    scaled = (tensor.float() * scale).clamp(FP8_E4M3_MIN, FP8_E4M3_MAX)
+    fp8 = stochastic_round_to_fp8_e4m3(scaled)
+    inv_scale = torch.ones(1, device=tensor.device, dtype=torch.float32) / scale
+    return fp8, inv_scale
+
+
 def to_fp8_e5m2(
     tensor: torch.Tensor,
     scale: torch.Tensor | None = None,
@@ -417,13 +445,12 @@ def stochastic_round_to_fp8_e4m3(tensor: torch.Tensor) -> torch.Tensor:
     nudge = eps_direction * FP8_E4M3_SMALLEST_NORMAL * 0.5
     hi = (lo_f + nudge).to(torch.float8_e4m3fn)
     # If hi == lo (at boundaries), try a larger nudge
+    # Always compute unconditionally to avoid CUDA synchronization from .any()
     same_mask = (hi.float() == lo_f) & ~exact_mask
-    if same_mask.any():
-        abs_lo = lo_f.abs().clamp(min=FP8_E4M3_SMALLEST_NORMAL)
-        # ULP is approximately value * 2^(-mantissa_bits) = value * 0.125
-        larger_nudge = eps_direction * abs_lo * 0.25
-        hi_retry = (lo_f + larger_nudge).to(torch.float8_e4m3fn)
-        hi = torch.where(same_mask, hi_retry, hi)
+    abs_lo = lo_f.abs().clamp(min=FP8_E4M3_SMALLEST_NORMAL)
+    larger_nudge = eps_direction * abs_lo * 0.25
+    hi_retry = (lo_f + larger_nudge).to(torch.float8_e4m3fn)
+    hi = torch.where(same_mask, hi_retry, hi)
 
     hi_f = hi.float()
 

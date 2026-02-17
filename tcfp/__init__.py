@@ -17,6 +17,7 @@ from tcfp.core import (
     fp8_matmul,
     to_fp8_e4m3,
     to_fp8_e4m3_nf_aware,
+    to_fp8_e4m3_sr,
     to_fp8_e5m2,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "fp8_matmul",
     "to_fp8_e4m3",
     "to_fp8_e4m3_nf_aware",
+    "to_fp8_e4m3_sr",
     "to_fp8_e5m2",
 ]
 

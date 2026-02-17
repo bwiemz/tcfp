@@ -316,8 +316,11 @@ try:
         # Scales_lo strides
         stride_sl_n,
         stride_sl_kb,
+        # SRR seed (runtime arg, ignored when STOCHASTIC_LO=False)
+        SRR_SEED,
         # Compile-time constants
         HAS_ERROR: tl.constexpr,
+        STOCHASTIC_LO: tl.constexpr,
         FP8_MAX: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -330,6 +333,9 @@ try:
         When ``HAS_ERROR`` is True, the kernel reads old quantisation error
         from ``error_old_ptr`` and adds it to the weight before quantisation.
         The new error is computed outside the kernel using stored FP8 values.
+
+        When ``STOCHASTIC_LO`` is True, W_lo uses stochastic rounding (SR)
+        instead of round-to-nearest.  ``E[SR(x)] = x`` (unbiased per-step).
 
         Uses power-of-2 scaling: ``inv_scale = exp2(ceil(log2(amax / FP8_MAX)))``
         matching :func:`_block_quantize_kernel` exactly.
@@ -388,7 +394,35 @@ try:
 
         w_lo_scaled = residual / safe_inv_scale_lo[:, None]
         w_lo_clamped = tl.maximum(tl.minimum(w_lo_scaled, FP8_MAX), -FP8_MAX)
-        w_lo_fp8 = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
+
+        if STOCHASTIC_LO:
+            # Stochastic rounding: RTN gives nearest, nudge finds adjacent
+            rtn = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
+            rtn_f = rtn.to(tl.float32)
+            diff = w_lo_clamped - rtn_f
+
+            # Find adjacent FP8 value via nudge (0.25 * |v| > ULP for E4M3)
+            direction = tl.where(diff >= 0, 1.0, -1.0)
+            abs_rtn = tl.maximum(tl.abs(rtn_f), 1e-12)
+            nudge = direction * abs_rtn * 0.25
+            other = (rtn_f + nudge).to(w_lo_ptr.dtype.element_ty)
+            other_f = other.to(tl.float32)
+
+            # P(select other) = |diff| / |gap|
+            gap = tl.maximum(tl.abs(other_f - rtn_f), 1e-45)
+            frac = tl.minimum(tl.abs(diff) / gap, 1.0)
+
+            # Stochastic select (unique seed per tile via linearised offsets)
+            sr_offsets = offs_n[:, None] * K + offs_k[None, :]
+            rand = tl.rand(SRR_SEED, sr_offsets)
+            # Treat as exact if diff is tiny OR boundary saturation (other==rtn)
+            boundary = tl.abs(other_f - rtn_f) < 1e-45
+            exact = (tl.abs(diff) < 1e-45) | boundary
+            w_lo_fp8 = tl.where(
+                exact, rtn, tl.where(rand < frac, other, rtn),
+            )
+        else:
+            w_lo_fp8 = w_lo_clamped.to(w_lo_ptr.dtype.element_ty)
 
         # NOTE: Error update is computed outside the kernel using the stored
         # FP8 values.  In-kernel dequant can differ from stored-value dequant
@@ -1226,6 +1260,7 @@ def fused_dual_quantize_fp8(
     weight: torch.Tensor,
     block_size: int = 128,
     error_buf: torch.Tensor | None = None,
+    stochastic_lo: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused W → W_hi + W_lo dual FP8 quantization in a single kernel.
 
@@ -1243,11 +1278,16 @@ def fused_dual_quantize_fp8(
     overwrites the buffer with the new quantisation error
     (``new_error = weight - dequant(W_hi) - dequant(W_lo)``).
 
+    When ``stochastic_lo=True``, W_lo uses stochastic rounding (SR) instead
+    of round-to-nearest.  ``E[SR(x)] = x`` (unbiased per-step), eliminating
+    the need for error feedback buffers.
+
     Args:
         weight:    (N, K) contiguous tensor in BF16 or FP32.
         block_size: Scaling block size along K (must divide K).
         error_buf: Optional (N, K) FP32 contiguous tensor for in-place
                    error-feedback I/O.
+        stochastic_lo: Use stochastic rounding for W_lo quantization.
 
     Returns:
         ``(w_hi_fp8, w_lo_fp8, scales_hi, scales_lo)`` where the FP8
@@ -1259,6 +1299,11 @@ def fused_dual_quantize_fp8(
     assert K % block_size == 0, (
         f"K ({K}) must be divisible by block_size ({block_size})"
     )
+    if stochastic_lo and error_buf is not None:
+        raise ValueError(
+            "stochastic_lo and error_buf are mutually exclusive: "
+            "SRR eliminates the need for error feedback buffers."
+        )
     if error_buf is not None:
         assert error_buf.dtype == torch.float32, "error_buf must be float32"
         assert error_buf.shape == (N, K), (
@@ -1282,14 +1327,17 @@ def fused_dual_quantize_fp8(
     # error; new error is computed outside the kernel using stored FP8 values
     # to avoid Triton compiler cast-folding issues.
     has_error = error_buf is not None
-    if has_error:
-        error_old = error_buf.clone()
-    else:
-        error_old = weight  # dummy, never accessed
+    error_old = error_buf.clone() if has_error else weight  # dummy when no error
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
         num_kb,
+    )
+
+    # Generate unique random seed for SRR (one per launch, cheap)
+    srr_seed: int = (
+        torch.randint(0, 2**31, (1,), device=weight.device).item()
+        if stochastic_lo else 0
     )
 
     _fused_dual_quantize_kernel[grid](  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -1319,7 +1367,9 @@ def fused_dual_quantize_fp8(
         # Scales_lo strides (layout: num_kb, N)
         scales_lo.stride(1),  # stride_sl_n: N-dim stride (axis 1)
         scales_lo.stride(0),  # stride_sl_kb: kb-dim stride (axis 0)
+        srr_seed,
         HAS_ERROR=has_error,
+        STOCHASTIC_LO=stochastic_lo,
         FP8_MAX=_FP8_E4M3_MAX,
         BLOCK_K=block_size,
     )

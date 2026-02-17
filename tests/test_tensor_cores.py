@@ -379,3 +379,208 @@ class TestTensorCoreConvergence:
             assert torch.isfinite(loss), f"NaN/Inf loss at step {_step}"
             loss.backward()
             opt.step()
+
+
+# ── ABD (Asymmetric Backward Decomposition) ────────────────────────────
+
+
+class TestABD:
+    """Tests for ABD — dropping W_lo from backward dgrad."""
+
+    def test_abd_forward_unchanged(self) -> None:
+        """ABD=True produces identical forward output to ABD=False."""
+        torch.manual_seed(42)
+        layer_std = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=False,
+        ).to(DEVICE)
+        layer_abd = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=False, abd=True,
+        ).to(DEVICE)
+        # Share weights
+        layer_abd.weight = layer_std.weight
+        layer_abd.bias = layer_std.bias
+
+        x = torch.randn(8, 128, device=DEVICE)
+        out_std = layer_std(x)
+        out_abd = layer_abd(x)
+        assert torch.equal(out_std, out_abd), "ABD should not affect forward"
+
+    def test_abd_backward_shapes(self) -> None:
+        """Gradients have correct shapes with ABD enabled."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, abd=True,
+        ).to(DEVICE)
+        x = torch.randn(8, 128, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert x.grad.shape == (8, 128)
+        assert layer.weight.grad is not None
+        assert layer.weight.grad.shape == (64, 128)
+
+    def test_abd_gradients_finite(self) -> None:
+        """No NaN/Inf in ABD gradients."""
+        layer = TCFPLinear(
+            256, 128, use_tensor_cores=True, abd=True,
+        ).to(DEVICE)
+        x = torch.randn(16, 256, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+        assert layer.weight.grad is not None
+        assert torch.isfinite(layer.weight.grad).all()
+
+    def test_abd_convergence(self) -> None:
+        """Training loss decreases with ABD enabled."""
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 32),
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model, mode=TCFPMode.TCFP12, skip_patterns=(),
+            use_tensor_cores=True, abd=True,
+        )
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x = torch.randn(32, 128, device=DEVICE)
+        target = torch.randn(32, 32, device=DEVICE)
+
+        losses: list[float] = []
+        for _step in range(50):
+            opt.zero_grad()
+            out = model(x)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"ABD loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        )
+
+    def test_abd_default_off(self) -> None:
+        """ABD is False by default."""
+        layer = TCFPLinear(128, 64, use_tensor_cores=True).to(DEVICE)
+        assert layer.abd is False
+
+    def test_abd_extra_repr(self) -> None:
+        """ABD=True appears in extra_repr."""
+        layer = TCFPLinear(128, 64, use_tensor_cores=True, abd=True)
+        assert "abd=True" in layer.extra_repr()
+
+    def test_abd_without_tensor_cores_warns(self) -> None:
+        """abd=True without use_tensor_cores emits warning and is ignored."""
+        import warnings as w_mod
+
+        with w_mod.catch_warnings(record=True) as caught:
+            w_mod.simplefilter("always")
+            layer = TCFPLinear(128, 64, use_tensor_cores=False, abd=True)
+        msgs = [str(x.message) for x in caught]
+        assert any("abd=True requires use_tensor_cores" in m for m in msgs)
+        assert layer.abd is False
+
+
+class TestSRR:
+    """Tests for SRR — stochastic rounding on W_lo (per-tensor TC path)."""
+
+    def test_srr_forward_runs(self) -> None:
+        """SRR per-tensor forward produces correct shapes."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, srr=True,
+        ).to(DEVICE)
+        x = torch.randn(8, 128, device=DEVICE)
+        out = layer(x)
+        assert out.shape == (8, 64)
+        assert torch.isfinite(out).all()
+
+    def test_srr_no_error_state(self) -> None:
+        """SRR disables error feedback — _error_state is None."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, srr=True,
+        ).to(DEVICE)
+        assert layer._error_state is None
+
+    def test_srr_overrides_error_feedback(self) -> None:
+        """SRR suppresses error_feedback even when explicitly True."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, srr=True, error_feedback=True,
+        ).to(DEVICE)
+        assert layer._error_state is None
+
+    def test_srr_backward_finite(self) -> None:
+        """Gradients are finite with SRR."""
+        layer = TCFPLinear(
+            256, 128, use_tensor_cores=True, srr=True,
+        ).to(DEVICE)
+        x = torch.randn(16, 256, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad).all()
+        assert layer.weight.grad is not None
+        assert torch.isfinite(layer.weight.grad).all()
+
+    def test_srr_convergence(self) -> None:
+        """Training loss decreases with SRR enabled."""
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 32),
+        ).to(DEVICE)
+        convert_to_tcfp(
+            model, mode=TCFPMode.TCFP12, skip_patterns=(),
+            use_tensor_cores=True, srr=True,
+        )
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x = torch.randn(32, 128, device=DEVICE)
+        target = torch.randn(32, 32, device=DEVICE)
+
+        losses: list[float] = []
+        for _step in range(50):
+            opt.zero_grad()
+            out = model(x)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"SRR loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        )
+
+    def test_srr_without_tc_warns(self) -> None:
+        """srr=True without use_tensor_cores emits warning and is ignored."""
+        import warnings as w_mod
+
+        with w_mod.catch_warnings(record=True) as caught:
+            w_mod.simplefilter("always")
+            layer = TCFPLinear(128, 64, use_tensor_cores=False, srr=True)
+        msgs = [str(x.message) for x in caught]
+        assert any("srr=True requires use_tensor_cores" in m for m in msgs)
+        assert layer.srr is False
+
+    def test_srr_delayed_scaling_warns(self) -> None:
+        """srr=True with delayed_scaling=True warns and disables DS."""
+        import warnings as w_mod
+
+        with w_mod.catch_warnings(record=True) as caught:
+            w_mod.simplefilter("always")
+            layer = TCFPLinear(
+                128, 64, use_tensor_cores=True,
+                srr=True, delayed_scaling=True,
+            )
+        msgs = [str(x.message) for x in caught]
+        assert any("mutually exclusive" in m for m in msgs)
+        assert layer.srr is True
+        assert layer.delayed_scaling is False
+
+    def test_srr_extra_repr(self) -> None:
+        """srr=True appears in extra_repr."""
+        layer = TCFPLinear(128, 64, use_tensor_cores=True, srr=True)
+        assert "srr=True" in layer.extra_repr()
+
+    def test_srr_default_off(self) -> None:
+        """SRR is False by default."""
+        layer = TCFPLinear(128, 64, use_tensor_cores=True).to(DEVICE)
+        assert layer.srr is False
