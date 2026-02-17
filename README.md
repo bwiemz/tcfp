@@ -375,9 +375,9 @@ The following entrypoints are the stable, user-facing API surface for model conv
 
 | Flag | What changes | Expected impact |
 |------|--------------|-----------------|
-| `use_tensor_cores=True` | Uses real FP8 tensor-core GEMMs (`torch._scaled_mm`) for `TCFPLinear` when layer dims are compatible | Enables FP8 tensor-core path (raw GEMMs faster than BF16), but end-to-end speed depends on quantization overhead |
-| `delayed_scaling=True` | Enables PDDS delayed scaling for TCFP-12 tensor-core path | Reduces scaling/amax overhead with convergence parity in reported TinyGPT runs |
-| `scale_block_size=32/64/128` | Switches from per-tensor to per-block scaling (Triton path) | Better dynamic range/outlier handling; currently adds overhead vs per-tensor `_scaled_mm` |
+| `use_tensor_cores=True` | Uses real FP8 tensor-core GEMMs for `TCFPLinear` when layer dims are compatible | Enables FP8 tensor-core path (raw GEMMs faster than BF16), but end-to-end speed depends on quantization overhead |
+| `delayed_scaling=True` | Enables Predictive Dual-Track Delayed Scaling (PDDS) for TCFP-12 tensor-core path | Reduces scaling/amax overhead with convergence parity in reported TinyGPT runs |
+| `scale_block_size=32/64/128` | Switches from per-tensor to per-block scaling (Triton path) | Better dynamic range/outlier handling; slower than per-tensor path in current repository benchmarks |
 | `use_fused_kernel=True` | Uses Triton fused dual-GEMM kernels when available | Lowers kernel launch and memory overhead vs unfused 2-GEMM path |
 | `use_cuda_ext=True` | Uses cuBLASLt fused forward dual-GEMM extension when available | Best forward-path performance among current implementations |
 | `error_feedback=True` | Enables residual error-feedback state across steps | Improves long-run quantization fidelity (stability/quality) |
