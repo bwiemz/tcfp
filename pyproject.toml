@@ -41,4 +41,3 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 [tool.basedpyright]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
-extraPaths = ["C:\\Users\\bwiem\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages"]
