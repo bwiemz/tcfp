@@ -322,6 +322,19 @@ convert_to_tcfp(model, mode=TCFPMode.TCFP12,
 
 At 7B scale, this saves **26.1 GB** of VRAM (the entire FP32 error buffer). SRR is mutually exclusive with `delayed_scaling` and requires `use_tensor_cores=True`. Convergence matches error-feedback mode exactly (1.07x vs 1.09x ppl ratio vs BF16).
 
+**Where the memory goes:** In EF mode, `TCFPLinear.__init__` creates an `ErrorFeedbackState` (`nn/__init__.py`), which lazily allocates an FP32 buffer matching the weight shape on first forward via `get_error()` (`core.py:320`). With `srr=True`, `_error_state` is set to `None` — no buffer is ever allocated (`nn/__init__.py`, guard: `if use_tensor_cores and error_feedback and not srr`).
+
+**RNG sources:** The per-tensor path uses `torch.rand_like()` (PyTorch's default CUDA PRNG, seedable via `torch.manual_seed()`). The block-scaled Triton path uses `tl.rand(seed, offset)` (Triton's built-in Philox PRNG) with a fresh random seed per kernel launch (`torch.randint(0, 2**31, ...)`). Per-element randomness is derived from linearised tile offsets (`offs_n * K + offs_k`), giving unique entropy per element. SRR is **not deterministic** across runs (different seeds each launch), but can be made deterministic by fixing the PRNG seed externally.
+
+**Throughput overhead:** SRR trades compute for memory. The block-scaled Triton path adds ~0-15% overhead at small/medium layer sizes (the `STOCHASTIC_LO: tl.constexpr` branch compiles to ~15 extra ALU ops per element including Philox RNG, nudge, and stochastic select). The per-tensor PyTorch path has higher overhead (~25-40%) because `stochastic_round_to_fp8_e4m3` allocates multiple temporary tensors on each call. Both paths add more overhead at very large dimensions (4K+) where the extra compute becomes proportionally significant. Use SRR when VRAM savings outweigh the throughput cost — typically memory-constrained scenarios where the alternative is not training at all.
+
+| Path | Layer Size | SRR vs EF Overhead |
+|------|-----------|-------------------|
+| Per-tensor TC | 1024x512 | +29% |
+| Per-tensor TC | 2048x1024 | +26% |
+| Block-scaled (B128) | 1024x512 | **-15%** (faster — no EF buffer ops) |
+| Block-scaled (B128) | 2048x1024 | +39% |
+
 ### Asymmetric Backward Decomposition (ABD)
 
 Drops W_lo from the backward dgrad computation: `dX = grad @ W_hi` (single GEMM instead of dual). This saves 1 GEMM per layer per backward pass (~20% of total training GEMMs) with no measurable quality impact (1.000x ppl ratio):
@@ -431,6 +444,8 @@ The following entrypoints are the stable, user-facing API surface for model conv
 | `use_cuda_ext=True` | Uses cuBLASLt fused forward dual-GEMM extension when available | Best forward-path performance among current implementations |
 | `error_feedback=True` | Enables residual error-feedback state across steps | Improves long-run quantization fidelity (stability/quality) |
 | `hp_grad_weight=True` | Keeps weight-gradient path high precision in tensor-core mode | Prioritizes training quality/stability over peak speed |
+| `srr=True` | Stochastic Residual Rounding on W_lo — eliminates FP32 error feedback buffer | Saves 4 bytes/param VRAM (26 GB at 7B); ~15-30% compute overhead. Mutually exclusive with `delayed_scaling` |
+| `abd=True` | Asymmetric Backward Decomposition — drops W_lo from backward dgrad | Saves 1 GEMM per layer per backward (~20% of training GEMMs); lossless (1.000x ppl) |
 
 ### Direct Quantization
 
@@ -458,7 +473,7 @@ x_recovered = dequantize_tcfp12(tcfp12)
 - Residual sparsity fast-path skips zero W_lo blocks at near-zero cost
 - Side-output elision saves 8.25 MB/forward (6.9% bandwidth) when `hp_grad_weight=True`
 - Int8 exponent encoding (E8M0) reduces scale storage 4x — all per-block scales use int8
-- SRR eliminates FP32 error feedback buffer entirely — saves 26.1 GB at 7B scale
+- SRR eliminates FP32 error feedback buffer entirely — saves 26.1 GB at 7B scale (trades ~15-30% compute overhead for memory)
 - ABD drops W_lo from backward dgrad — saves 1 GEMM per layer per backward pass
 
 **Current limitations:**
