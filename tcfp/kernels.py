@@ -1499,7 +1499,7 @@ def fused_dual_quantize_fp8(
     )
 
     # Generate unique random seed for SRR (one per launch, cheap)
-    srr_seed: int = (
+    srr_seed: int = int(
         torch.randint(0, 2**31, (1,), device=weight.device).item()
         if stochastic_lo else 0
     )
