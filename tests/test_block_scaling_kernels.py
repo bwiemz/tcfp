@@ -28,6 +28,7 @@ try:
         block_dequantize_fp8,
         block_quantize_fp8,
         block_scaled_gemm,
+        fused_block_scaled_backward_dx,
         fused_block_scaled_dual_gemm_backward_dx,
         fused_block_scaled_dual_gemm_forward,
         is_triton_available,
@@ -286,6 +287,118 @@ class TestFusedBlockScaledDualGemm:
         )
         assert result.shape == (M, N)
         assert torch.isfinite(result).all()
+
+
+# ── Test: Fused block-scaled backward dX kernel ──────────────────────────
+
+
+def _reference_backward_dx(
+    grad_fp8: torch.Tensor,
+    w_hi_fp8: torch.Tensor,
+    w_lo_fp8: torch.Tensor,
+    grad_scales: torch.Tensor,
+    w_hi_scales: torch.Tensor,
+    w_lo_scales: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Reference: dequant all to FP32, then two separate matmuls."""
+    w_hi_deq = block_dequantize_fp8(w_hi_fp8, w_hi_scales, block_size)  # type: ignore
+    w_lo_deq = block_dequantize_fp8(w_lo_fp8, w_lo_scales, block_size)  # type: ignore
+    grad_deq = block_dequantize_fp8(grad_fp8, grad_scales, block_size)  # type: ignore
+    return grad_deq @ w_hi_deq + grad_deq @ w_lo_deq
+
+
+class TestFusedBackwardDX:
+    """Tests for fused_block_scaled_backward_dx Triton kernel."""
+
+    @requires_triton
+    @pytest.mark.parametrize(
+        "M,D_out,D_in,bs",
+        [
+            (64, 128, 64, 64),
+            (128, 256, 128, 128),
+            (64, 256, 128, 64),
+        ],
+    )
+    def test_matches_reference(self, M: int, D_out: int, D_in: int, bs: int) -> None:
+        """Fused backward dX must numerically match the reference two-matmul path."""
+        grad_fp8, grad_s = _make_block_quantized(M, D_out, bs)
+        # W has shape (D_out, D_in); its scales are (D_in//bs, D_out)
+        w_hi = torch.randn(D_out, D_in, device=DEVICE)
+        w_lo = torch.randn(D_out, D_in, device=DEVICE)
+        from tcfp.kernels import block_quantize_fp8  # type: ignore
+        w_hi_fp8, w_hi_s = block_quantize_fp8(w_hi, block_size=bs)  # type: ignore
+        w_lo_fp8, w_lo_s = block_quantize_fp8(w_lo, block_size=bs)  # type: ignore
+
+        ref = _reference_backward_dx(
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, bs,
+        )
+        result = fused_block_scaled_backward_dx(  # type: ignore
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, block_size=bs,
+        )
+
+        assert result.shape == (M, D_in)
+        assert result.dtype == torch.float32
+        # tl.dot with float32 inputs uses TF32 on modern GPUs (10 mantissa bits
+        # vs 23 for pure float32), causing ~1e-2 absolute differences vs the
+        # pure FP32 reference. This is acceptable for gradient computation.
+        assert torch.allclose(result, ref, atol=1e-2, rtol=1e-3), (
+            f"Max diff: {(result - ref).abs().max().item():.2e}"
+        )
+
+    @requires_triton
+    def test_output_shape_dtype(self) -> None:
+        M, D_out, D_in, bs = 128, 256, 128, 64
+        grad_fp8, grad_s = _make_block_quantized(M, D_out, bs)
+        w_hi_fp8, w_hi_s = _make_block_quantized(D_out, D_in, bs)
+        w_lo_fp8, w_lo_s = _make_block_quantized(D_out, D_in, bs)
+
+        result = fused_block_scaled_backward_dx(  # type: ignore
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, block_size=bs,
+        )
+        assert result.shape == (M, D_in)
+        assert result.dtype == torch.float32
+        assert torch.isfinite(result).all()
+
+    @requires_triton
+    def test_zero_lo_matches_hi_only(self) -> None:
+        """When W_lo is zero (sentinel scales), result = grad @ W_hi only."""
+        M, D_out, D_in, bs = 64, 128, 64, 64
+        grad_fp8, grad_s = _make_block_quantized(M, D_out, bs)
+        w_hi_fp8, w_hi_s = _make_block_quantized(D_out, D_in, bs)
+        # Zero W_lo: FP8 zeros + sentinel scale int8(-128)
+        w_lo_fp8 = torch.zeros(D_out, D_in, device=DEVICE, dtype=torch.float8_e4m3fn)
+        # Sentinel -128 → exp2(-128)≈0, but with sentinel restore → 0.0
+        w_lo_s = torch.full((D_in // bs, D_out), -128, device=DEVICE, dtype=torch.int8)
+
+        result = fused_block_scaled_backward_dx(  # type: ignore
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, block_size=bs,
+        )
+        # Reference: grad @ W_hi only (W_lo zeroed by sentinel)
+        w_hi_deq = block_dequantize_fp8(w_hi_fp8, w_hi_s, bs)  # type: ignore
+        grad_deq = block_dequantize_fp8(grad_fp8, grad_s, bs)  # type: ignore
+        ref_hi_only = grad_deq @ w_hi_deq
+
+        assert torch.allclose(result, ref_hi_only, atol=1e-5), (
+            f"Max diff: {(result - ref_hi_only).abs().max().item():.2e}"
+        )
+
+    @requires_triton
+    def test_dispatch_via_legacy_fn(self) -> None:
+        """fused_block_scaled_dual_gemm_backward_dx dispatches to Triton kernel."""
+        M, D_out, D_in, bs = 64, 128, 64, 64
+        grad_fp8, grad_s = _make_block_quantized(M, D_out, bs)
+        w_hi_fp8, w_hi_s = _make_block_quantized(D_out, D_in, bs)
+        w_lo_fp8, w_lo_s = _make_block_quantized(D_out, D_in, bs)
+
+        ref = _reference_backward_dx(
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, bs,
+        )
+        result = fused_block_scaled_dual_gemm_backward_dx(  # type: ignore
+            grad_fp8, w_hi_fp8, w_lo_fp8, grad_s, w_hi_s, w_lo_s, block_size=bs,
+        )
+        # tl.dot uses TF32 on modern GPUs (~1e-2 abs error vs pure FP32 ref).
+        assert torch.allclose(result, ref, atol=1e-2, rtol=1e-3)
 
 
 # ── Test: Integration with TCFPLinear ───────────────────────────────────

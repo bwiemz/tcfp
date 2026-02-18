@@ -187,7 +187,7 @@ TCFP-12 moves less data than BF16 (12.5 bits vs 16 bits) and raw FP8 GEMMs are 1
 
 2. **Fuse quantization into GEMM** — The next step: quantize W tiles on-the-fly as they're loaded from GMEM into SMEM inside the GEMM kernel itself. This would eliminate the quantization kernels entirely, leaving only the GEMM + bias add.
 
-3. **Fused dual-GEMM backward** — *(Forward done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. The backward pass still uses two separate dispatches (cuBLASLt doesn't support E5M2 as A-type on SM 12.0+). A Triton kernel that fuses both backward dX GEMMs — loading grad once, computing `grad @ W_hi` and `grad @ W_lo`, adding in registers — would halve backward memory bandwidth.
+3. **Fused dual-GEMM backward** — *(Done)* The cuBLASLt C++ extension fuses both forward GEMMs via beta=1 accumulation. For the backward dX pass, a Triton kernel (`_fused_block_scaled_backward_dx_kernel`) loads the gradient matrix once and computes `grad @ (W_hi + W_lo)` in a single persistent-tiled pass — halving backward memory bandwidth vs the prior two-matmul path. W scales are applied inline in registers; the zero-residual sentinel (int8 -128) skips W_lo contributions without branching. cuBLASLt is not used for backward (doesn't support E5M2 as A-type on SM 12.0+).
 
 4. **Persistent tiling** — *(Done)* Both dual-GEMM Triton kernels use persistent tiling: each CTA loops over multiple output tiles to eliminate wave quantization (last-wave SM underutilization). Controlled via `persistent=True` (default) and `launch_mult` (CTAs per SM). When the tile count doesn't divide evenly by SM count, persistent tiling keeps all SMs busy.
 

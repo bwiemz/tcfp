@@ -1040,6 +1040,170 @@ try:
 
             tile_id += num_programs
 
+    # ── Backward dX fused kernel ──────────────────────────────────────
+
+    _BACKWARD_DX_CONFIGS = [
+        triton.Config({"BLOCK_M": 64, "GROUP_M": 8}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "GROUP_M": 8}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "GROUP_M": 8}, num_stages=3, num_warps=8),
+    ]
+
+    @triton.autotune(configs=_BACKWARD_DX_CONFIGS, key=["M", "N", "K", "BLOCK_K"])
+    @triton.jit
+    def _fused_block_scaled_backward_dx_kernel(
+        # Pointers: A=grad(M,K=D_out), B_hi=W_hi(K=D_out,N=D_in), B_lo=W_lo same
+        grad_ptr,
+        w_hi_ptr,
+        w_lo_ptr,
+        out_ptr,
+        # Scale pointers
+        scales_grad_ptr,   # (K//bs, M) int8 exponents
+        scales_whi_ptr,    # (N//bs, K) int8 exponents — N=D_in, K=D_out
+        scales_wlo_ptr,    # (N//bs, K) int8 exponents
+        # Dimensions
+        M,
+        N,
+        K,
+        num_k_blocks,
+        # Strides: grad(M, K=D_out)
+        stride_gm,
+        stride_gk,
+        # Strides: W_hi(K=D_out, N=D_in) — natural layout for backward B
+        stride_hk,
+        stride_hn,
+        # Strides: W_lo
+        stride_lk,
+        stride_ln,
+        # Strides: out(M, N=D_in)
+        stride_om,
+        stride_on,
+        # Scale strides: scales_grad[kb, m]
+        stride_sg_kb,
+        stride_sg_m,
+        # Scale strides: scales_w*[n_block, k_abs]
+        stride_sw_nb,
+        stride_sw_k,
+        # Meta-parameters
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,   # = block_size; also controls BLOCK_N
+        GROUP_M: tl.constexpr,
+        num_sms_launch,
+    ):
+        """Fused backward dX: ``dX = grad @ (W_hi + W_lo)``.
+
+        Loads grad once and combines W_hi + W_lo contributions in registers,
+        eliminating intermediate FP32 GMEM writes and a second grad read.
+
+        N-tile size is fixed to ``BLOCK_K`` (= block_size) so that each
+        N-tile spans exactly one D_in scale block, giving clean per-tile
+        scale alignment for ``scales_w*[n_block, k_abs]``.
+
+        Scale layouts (backward perspective where K=D_out, N=D_in)::
+
+            scales_grad[kb,   m]       — one scale per (D_out-block, M-elem)
+            scales_w*  [nb,   k_abs]   — one scale per (D_in-block,  D_out-elem)
+
+        The W scale varies per K-element within a tile (column-wise in W),
+        applied as row-wise scaling of the (BLOCK_K, BLOCK_N) W sub-tile.
+        """
+        BLOCK_N: tl.constexpr = BLOCK_K  # one D_in scale-block per N-tile
+
+        # ── Persistent tile loop setup ──
+        start_pid = tl.program_id(0)
+        num_m = tl.cdiv(M, BLOCK_M)
+        num_n = tl.cdiv(N, BLOCK_N)
+        num_tiles = num_m * num_n
+        num_programs = min(num_sms_launch, num_tiles)
+
+        tile_id = start_pid
+        while tile_id < num_tiles:
+            # ── GROUP_M tile mapping for L2 reuse ──
+            num_in_group = GROUP_M * num_n
+            group_id = tile_id // num_in_group
+            first_m = group_id * GROUP_M
+            group_m = min(num_m - first_m, GROUP_M)
+            pid_m = first_m + ((tile_id % num_in_group) % group_m)
+            pid_n = (tile_id % num_in_group) // group_m
+
+            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+            offs_k = tl.arange(0, BLOCK_K)
+
+            # grad(M, K=D_out): K is the contraction axis
+            grad_ptrs = (
+                grad_ptr + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gk
+            )
+            # W_hi/W_lo(K=D_out, N=D_in): backward B matrix
+            whi_ptrs = (
+                w_hi_ptr + offs_k[:, None] * stride_hk + offs_n[None, :] * stride_hn
+            )
+            wlo_ptrs = (
+                w_lo_ptr + offs_k[:, None] * stride_lk + offs_n[None, :] * stride_ln
+            )
+
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            for kb in range(0, num_k_blocks):
+                k_mask = offs_k < (K - kb * BLOCK_K)
+                offs_k_abs = kb * BLOCK_K + offs_k  # absolute D_out positions
+
+                # ── Load grad tile and apply grad scale ──
+                # grad_scales[kb, offs_m]: one scale per M-element for this K-block
+                g = tl.load(grad_ptrs, mask=k_mask[None, :], other=0.0).to(tl.float32)
+                sg = tl.exp2(
+                    tl.load(
+                        scales_grad_ptr
+                        + kb * stride_sg_kb
+                        + offs_m * stride_sg_m
+                    ).to(tl.float32)
+                )  # (BLOCK_M,)
+                g_scaled = g * sg[:, None]  # (BLOCK_M, BLOCK_K)
+
+                # ── Load W tiles and dequantize with per-K-element scales ──
+                # W scales: scales_w[pid_n, offs_k_abs] — one per K-element for
+                # this N-block (pid_n = D_in block index when BLOCK_N = block_size).
+                # Applied row-wise: each K-row of W has its own scale.
+                whi = tl.load(whi_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+                wlo = tl.load(wlo_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+
+                swhi = tl.exp2(
+                    tl.load(
+                        scales_whi_ptr
+                        + pid_n * stride_sw_nb
+                        + offs_k_abs * stride_sw_k
+                    ).to(tl.float32)
+                )  # (BLOCK_K,)
+                swlo_raw = tl.load(
+                    scales_wlo_ptr
+                    + pid_n * stride_sw_nb
+                    + offs_k_abs * stride_sw_k
+                )  # (BLOCK_K,) int8
+                swlo = tl.exp2(swlo_raw.to(tl.float32))
+                # Restore zero sentinel: int8 -128 → 0.0 (zero residual block)
+                swlo = tl.where(swlo_raw == -128, 0.0, swlo)
+
+                # Row-wise dequant of W: W_combined[k, n] = whi[k,n]*swhi[k] + wlo[k,n]*swlo[k]
+                w_combined = whi * swhi[:, None] + wlo * swlo[:, None]  # (BLOCK_K, BLOCK_N)
+
+                # ── Accumulate ──
+                acc += tl.dot(g_scaled, w_combined, max_num_imprecise_acc=0)
+
+                # Advance K pointers
+                grad_ptrs += BLOCK_K * stride_gk
+                whi_ptrs += BLOCK_K * stride_hk
+                wlo_ptrs += BLOCK_K * stride_lk
+
+            # ── Store dX (masked for partial tiles) ──
+            offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            out_ptrs = (
+                out_ptr + offs_om[:, None] * stride_om + offs_on[None, :] * stride_on
+            )
+            out_mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+            tl.store(out_ptrs, acc, mask=out_mask)
+
+            tile_id += num_programs
+
 except ImportError:
     pass
 
@@ -1659,6 +1823,108 @@ def fused_act_quant_dual_gemm_forward(
     return output, None, None
 
 
+def fused_block_scaled_backward_dx(
+    grad_fp8: torch.Tensor,
+    w_hi_fp8: torch.Tensor,
+    w_lo_fp8: torch.Tensor,
+    grad_scales: torch.Tensor,
+    w_hi_scales: torch.Tensor,
+    w_lo_scales: torch.Tensor,
+    block_size: int,
+    persistent: bool = True,
+    launch_mult: int = 1,
+) -> torch.Tensor:
+    """Triton-fused backward dX for block-scaled TCFP-12.
+
+    Loads grad once and combines W_hi + W_lo contributions in registers,
+    eliminating intermediate FP32 tensors and a second grad read vs.
+    the two-GEMM dequant path.
+
+    N-tile size is fixed to ``block_size`` so that each N-tile spans
+    exactly one D_in scale block, giving clean scale alignment.
+
+    Args:
+        grad_fp8:    (M, D_out) FP8 E5M2 gradient.
+        w_hi_fp8:    (D_out, D_in) FP8 E4M3 main weight.
+        w_lo_fp8:    (D_out, D_in) FP8 E4M3 residual weight.
+        grad_scales: (D_out // block_size, M) int8 exponents (E8M0).
+        w_hi_scales: (D_in // block_size, D_out) int8 exponents (E8M0).
+        w_lo_scales: (D_in // block_size, D_out) int8 exponents (E8M0).
+        block_size:  Scaling block size (also fixes N-tile size).
+        persistent:  Use persistent tiling (multiple tiles per CTA).
+        launch_mult: CTAs per SM for persistent tiling.
+
+    Returns:
+        (M, D_in) FP32 grad_input tensor.
+    """
+    M, D_out = grad_fp8.shape
+    D_out2, D_in = w_hi_fp8.shape
+    assert D_out == D_out2 and w_lo_fp8.shape == (D_out, D_in), (
+        f"Shape mismatch: grad({M},{D_out}), "
+        f"w_hi({D_out2},{D_in}), w_lo{w_lo_fp8.shape}"
+    )
+    assert D_out % block_size == 0, (
+        f"D_out={D_out} must be divisible by block_size={block_size}"
+    )
+    assert D_in % block_size == 0, (
+        f"D_in={D_in} must be divisible by block_size={block_size}"
+    )
+
+    out = torch.empty((M, D_in), device=grad_fp8.device, dtype=torch.float32)
+    num_k_blocks = D_out // block_size  # K = D_out
+    num_n_tiles = D_in // block_size    # BLOCK_N = block_size
+
+    num_sms = torch.cuda.get_device_properties(grad_fp8.device).multi_processor_count
+    num_sms_launch = num_sms * launch_mult if persistent else (1 << 30)
+
+    grid = lambda META: (  # noqa: E731
+        max(
+            1,
+            min(
+                num_sms_launch,
+                triton.cdiv(M, META["BLOCK_M"])  # pyright: ignore[reportPossiblyUnboundVariable]
+                * num_n_tiles,
+            ),
+        ),
+    )
+
+    _fused_block_scaled_backward_dx_kernel[grid](  # pyright: ignore[reportPossiblyUnboundVariable]
+        grad_fp8,
+        w_hi_fp8,
+        w_lo_fp8,
+        out,
+        grad_scales,
+        w_hi_scales,
+        w_lo_scales,
+        M,
+        D_in,
+        D_out,
+        num_k_blocks,
+        # grad(M, D_out): stride_gm, stride_gk
+        grad_fp8.stride(0),
+        grad_fp8.stride(1),
+        # w_hi(D_out, D_in): backward B in (K=D_out, N=D_in) natural layout
+        w_hi_fp8.stride(0),
+        w_hi_fp8.stride(1),
+        # w_lo same layout
+        w_lo_fp8.stride(0),
+        w_lo_fp8.stride(1),
+        # out(M, D_in)
+        out.stride(0),
+        out.stride(1),
+        # grad_scales(D_out//bs, M): stride_sg_kb=M, stride_sg_m=1
+        grad_scales.stride(0),
+        grad_scales.stride(1),
+        # w_hi_scales(D_in//bs, D_out): stride_sw_nb=D_out, stride_sw_k=1
+        w_hi_scales.stride(0),
+        w_hi_scales.stride(1),
+        # Note: w_lo_scales passed as separate ptr; strides match w_hi_scales layout
+        BLOCK_K=block_size,
+        num_sms_launch=num_sms_launch,
+    )
+    return out
+
+
 def fused_block_scaled_dual_gemm_backward_dx(
     grad_fp8: torch.Tensor,
     w_hi_fp8: torch.Tensor,
@@ -1670,10 +1936,8 @@ def fused_block_scaled_dual_gemm_backward_dx(
 ) -> torch.Tensor:
     """Backward dX for block-scaled TCFP-12: ``dX = grad @ W_hi + grad @ W_lo``.
 
-    Weight block scales are along D_in (last dim), but the backward GEMM's
-    K-dimension is D_out — the scale axes don't align.  Rather than a
-    complex re-blocking kernel, we dequantize to FP32 and use ``torch.matmul``
-    which still runs on tensor cores for FP32.
+    Dispatches to ``fused_block_scaled_backward_dx`` (single Triton kernel) when
+    Triton is available.  Falls back to dequant-then-combined-matmul otherwise.
 
     Args:
         grad_fp8:    (M, D_out) FP8 E5M2 gradient.
@@ -1687,8 +1951,19 @@ def fused_block_scaled_dual_gemm_backward_dx(
     Returns:
         (M, D_in) FP32 grad_input tensor.
     """
+    if _TRITON_AVAILABLE:
+        return fused_block_scaled_backward_dx(
+            grad_fp8,
+            w_hi_fp8,
+            w_lo_fp8,
+            grad_scales,
+            w_hi_scales,
+            w_lo_scales,
+            block_size=block_size,
+        )
+    # Fallback: dequant to FP32, combine W, single matmul (1 GEMM instead of 2)
     w_hi_deq = block_dequantize_fp8(w_hi_fp8, w_hi_scales, block_size)
     w_lo_deq = block_dequantize_fp8(w_lo_fp8, w_lo_scales, block_size)
+    w_hi_deq.add_(w_lo_deq)  # in-place combine
     grad_deq = block_dequantize_fp8(grad_fp8, grad_scales, block_size)
-
-    return grad_deq @ w_hi_deq + grad_deq @ w_lo_deq
+    return grad_deq @ w_hi_deq
