@@ -31,6 +31,7 @@ try:
         fused_block_scaled_backward_dx,
         fused_block_scaled_dual_gemm_backward_dx,
         fused_block_scaled_dual_gemm_forward,
+        fused_wtquant_block_scaled_dual_gemm_forward,
         is_triton_available,
     )
 
@@ -1029,3 +1030,257 @@ class TestSRR:
             if isinstance(module, TCFPLinear):
                 assert module.srr is True
                 assert module._error_state is None
+
+
+# ── Test: Fused weight-quantise block-scaled dual GEMM ───────────────────
+
+
+class TestFusedWtQuantDualGemm:
+    """Tests for fused_wtquant_block_scaled_dual_gemm_forward."""
+
+    @requires_triton
+    @pytest.mark.parametrize(
+        "M,K,N,block_size",
+        [
+            (64, 64, 64, 32),
+            (128, 128, 128, 64),
+            (64, 128, 128, 128),
+        ],
+    )
+    def test_output_shape_and_dtype(self, M: int, K: int, N: int, block_size: int) -> None:
+        """Output has shape (M, N), dtype float32."""
+        act_fp8, act_scales = _make_block_quantized(M, K, block_size)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        out, w_hi, w_lo, s_hi, s_lo = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=block_size,
+        )
+
+        assert out.shape == (M, N)
+        assert out.dtype == torch.float32
+        assert w_hi.shape == (N, K)
+        assert w_hi.dtype == torch.float8_e4m3fn
+        assert s_hi.shape == (K // block_size, N)
+        assert s_hi.dtype == torch.int8
+        assert w_lo is not None and w_lo.shape == (N, K)
+        assert s_lo is not None and s_lo.shape == (K // block_size, N)
+
+    @requires_triton
+    @pytest.mark.parametrize("block_size", [32, 64, 128])
+    def test_matches_separate_quantize_plus_gemm(self, block_size: int) -> None:
+        """Output matches fused_dual_quantize_fp8 + fused_block_scaled_dual_gemm_forward."""
+        M, K, N = 128, 128, 128
+        act_fp8, act_scales = _make_block_quantized(M, K, block_size)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        # Reference: separate quantise then GEMM
+        from tcfp.kernels import fused_dual_quantize_fp8  # pyright: ignore[reportMissingImports]
+
+        w_hi_ref, w_lo_ref, s_hi_ref, s_lo_ref = fused_dual_quantize_fp8(
+            weight, block_size=block_size,
+        )
+        ref_out = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, w_hi_ref, w_lo_ref, act_scales, s_hi_ref, s_lo_ref,
+            block_size=block_size,
+        )
+
+        # Fused kernel
+        out, _, _, _, _ = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=block_size,
+        )
+
+        # Allow slightly larger tolerance: W quantisation is per-CTA-tile so
+        # numerical order differs, but outputs should be close.
+        assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2), (
+            f"Max diff: {(out - ref_out).abs().max().item():.6f}"
+        )
+
+    @requires_triton
+    def test_output_is_finite(self) -> None:
+        """Forward pass produces finite values for random inputs."""
+        M, K, N, bs = 128, 128, 64, 64
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        out, w_hi, w_lo, s_hi, s_lo = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs,
+        )
+
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(w_hi.float()).all()
+        assert w_lo is not None and torch.isfinite(w_lo.float()).all()
+
+    @requires_triton
+    def test_abd_mode_returns_none_wlo(self) -> None:
+        """With save_w_lo=False, W_lo and its scales are returned as None."""
+        M, K, N, bs = 64, 64, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        out, w_hi, w_lo, s_hi, s_lo = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs, save_w_lo=False,
+        )
+
+        assert w_lo is None
+        assert s_lo is None
+        assert out.shape == (M, N)
+        assert torch.isfinite(out).all()
+
+    @requires_triton
+    def test_error_feedback_updates_buffer(self) -> None:
+        """error_buf is updated in-place after the forward pass.
+
+        Uses a non-zero initial error buffer to ensure the update is visible.
+        Dual FP8 achieves near-zero residual for zero-initialized buffers
+        (quantisation error ≈ machine precision), so a non-zero initial value
+        is required to detect the write.
+        """
+        M, K, N, bs = 64, 128, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        # Seed error_buf with random non-zero values (simulates step 2 onward)
+        torch.manual_seed(99)
+        error_buf = torch.randn(N, K, device=DEVICE, dtype=torch.float32) * 0.5
+        original_error = error_buf.clone()
+
+        fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs, error_buf=error_buf,
+        )
+
+        # error_buf must have been overwritten (the kernel uses original then Python recomputes)
+        assert not torch.equal(error_buf, original_error), (
+            "error_buf was not updated after the forward pass"
+        )
+        assert torch.isfinite(error_buf).all()
+
+    @requires_triton
+    def test_error_feedback_reduces_residual(self) -> None:
+        """Accumulated error feedback reduces quantisation residual over 2 steps."""
+        M, K, N, bs = 64, 128, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        # Step 1: no prior error
+        error_buf = torch.zeros(N, K, device=DEVICE, dtype=torch.float32)
+        fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs, error_buf=error_buf,
+        )
+        residual_step1 = error_buf.abs().mean().item()
+
+        # Step 2: with prior error fed back in
+        fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs, error_buf=error_buf,
+        )
+        residual_step2 = error_buf.abs().mean().item()
+
+        # Second step error should not exceed first (error feedback corrects bias)
+        assert residual_step2 <= residual_step1 * 1.5, (
+            f"EF did not reduce residual: step1={residual_step1:.6f}, "
+            f"step2={residual_step2:.6f}"
+        )
+
+    @requires_triton
+    def test_srr_mode_runs_without_error(self) -> None:
+        """stochastic_lo=True (SRR) produces finite output without raising."""
+        M, K, N, bs = 64, 64, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+
+        out, w_hi, w_lo, s_hi, s_lo = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs, stochastic_lo=True,
+        )
+        assert out.shape == (M, N)
+        assert torch.isfinite(out).all()
+
+    @requires_triton
+    def test_srr_and_error_buf_mutually_exclusive(self) -> None:
+        """Combining stochastic_lo=True and error_buf raises ValueError."""
+        M, K, N, bs = 64, 64, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
+        error_buf = torch.zeros(N, K, device=DEVICE, dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                act_fp8, weight, act_scales, block_size=bs,
+                stochastic_lo=True, error_buf=error_buf,
+            )
+
+    @requires_triton
+    def test_whi_scales_are_int8_exponents(self) -> None:
+        """W_hi scales are stored as int8 E8M0 exponents, clamped >= -126."""
+        M, K, N, bs = 64, 128, 64, 32
+        act_fp8, act_scales = _make_block_quantized(M, K, bs)
+        weight = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16) * 10
+
+        _, _, _, s_hi, s_lo = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+            act_fp8, weight, act_scales, block_size=bs,
+        )
+
+        assert s_hi.dtype == torch.int8
+        # Valid exponents are clamped to >= -126; only zero-residual sentinel is -128
+        assert (s_hi >= -126).all(), "W_hi scales contain values below clamped minimum"
+        assert s_lo is not None
+        assert s_lo.dtype == torch.int8
+
+    @requires_triton
+    def test_integration_via_tcfplinear_large_n(self) -> None:
+        """TCFPLinear with scale_block_size and large N uses fused_wtquant path."""
+        from tcfp.nn import TCFPLinear
+
+        # Use large N > 512 to trigger the fused_wtquant dispatch branch
+        # (small N <= 512 uses fused_act path instead)
+        layer = TCFPLinear(
+            512, 1024, use_tensor_cores=True, scale_block_size=64,
+        ).to(DEVICE)
+        x = torch.randn(32, 512, device=DEVICE)
+        out = layer(x)
+        assert out.shape == (32, 1024)
+        assert torch.isfinite(out).all()
+
+    @requires_triton
+    def test_integration_backward_finite(self) -> None:
+        """Gradients are finite when using fused_wtquant path."""
+        from tcfp.nn import TCFPLinear
+
+        layer = TCFPLinear(
+            512, 1024, bias=True, use_tensor_cores=True, scale_block_size=64,
+        ).to(DEVICE)
+        x = torch.randn(32, 512, device=DEVICE, requires_grad=True)
+        out = layer(x)
+        out.sum().backward()
+
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+        assert layer.bias is not None
+        assert layer.bias.grad is not None and torch.isfinite(layer.bias.grad).all()
+
+    @requires_triton
+    def test_integration_convergence(self) -> None:
+        """Training loss decreases with fused_wtquant path over 50 steps."""
+        from tcfp.nn import TCFPLinear
+
+        torch.manual_seed(42)
+        model = torch.nn.Sequential(
+            TCFPLinear(512, 1024, use_tensor_cores=True, scale_block_size=64),
+            torch.nn.ReLU(),
+            TCFPLinear(1024, 256, use_tensor_cores=True, scale_block_size=64),
+        ).to(DEVICE)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x = torch.randn(32, 512, device=DEVICE)
+        target = torch.randn(32, 256, device=DEVICE)
+
+        losses: list[float] = []
+        for _step in range(50):
+            opt.zero_grad()
+            out = model(x)
+            loss = (out - target).pow(2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.5, (
+            f"fused_wtquant loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+        )

@@ -1204,6 +1204,329 @@ try:
 
             tile_id += num_programs
 
+    # ── Fused weight-quantise + block-scaled dual GEMM ───────────────────
+    # Same register pressure as fused-act-quant: BF16 W doubles SMEM vs FP8.
+    # With BLOCK_K=block_size, two pipeline stages fit within the SM limit.
+    _FUSED_WTQUANT_DUAL_GEMM_CONFIGS = [
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "GROUP_M": 8},
+            num_stages=2,
+            num_warps=8,
+        ),
+    ]
+
+    @triton.autotune(
+        configs=_FUSED_WTQUANT_DUAL_GEMM_CONFIGS,
+        key=["M", "N", "K", "BLOCK_K"],
+    )
+    @triton.jit
+    def _fused_wtquant_block_scaled_dual_gemm_kernel(
+        # Input pointers
+        a_ptr,              # (M, K) FP8 E4M3 activations (pre-quantised)
+        w_ptr,              # (N, K) BF16/FP32 weight (quantised on-the-fly)
+        error_old_ptr,      # (N, K) FP32 old error (read when HAS_ERROR=True)
+        out_ptr,            # (M, N) FP32 output
+        # Side-output pointers (written from pid_m==0 CTAs only)
+        w_hi_out_ptr,           # (N, K) FP8 E4M3 — W_hi for backward
+        w_lo_out_ptr,           # (N, K) FP8 E4M3 — W_lo for backward
+        scales_whi_out_ptr,     # (num_kb, N) int8 exponents — W_hi scales
+        scales_wlo_out_ptr,     # (num_kb, N) int8 exponents — W_lo scales
+        # Input activation-scale pointer
+        scales_a_ptr,       # (num_kb, M) int8 exponents
+        # Dimensions
+        M,
+        N,
+        K,
+        num_k_blocks,
+        # A strides (FP8, (M, K) row-major)
+        stride_am,
+        stride_ak,
+        # W strides (BF16/FP32, (N, K) row-major)
+        stride_wn,
+        stride_wk,
+        # Error-old strides (0 when HAS_ERROR=False)
+        stride_eon,
+        stride_eok,
+        # Output strides
+        stride_om,
+        stride_on,
+        # W_hi side-output strides ((N, K) row-major)
+        stride_who_n,
+        stride_who_k,
+        # W_lo side-output strides ((N, K) row-major)
+        stride_wlo_n,
+        stride_wlo_k,
+        # W_hi scale side-output strides ((num_kb, N) layout)
+        stride_swhi_n,
+        stride_swhi_kb,
+        # W_lo scale side-output strides ((num_kb, N) layout)
+        stride_swlo_n,
+        stride_swlo_kb,
+        # Activation-scale strides ((num_kb, M) layout)
+        stride_sa_m,
+        stride_sa_kb,
+        # SRR seed (ignored when STOCHASTIC_LO=False)
+        SRR_SEED,
+        # Compile-time constants
+        FP8_MAX: tl.constexpr,
+        # Meta-parameters
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        SPARSE_THRESHOLD: tl.constexpr,
+        HAS_ERROR: tl.constexpr,
+        SAVE_W_HI: tl.constexpr,
+        SAVE_W_LO: tl.constexpr,
+        STOCHASTIC_LO: tl.constexpr,
+        num_sms_launch,
+    ):
+        """Fused on-the-fly weight quantisation + block-scaled dual-GEMM forward.
+
+        Like :func:`_fused_block_scaled_dual_gemm_kernel` but takes BF16/FP32
+        weight instead of pre-quantised FP8.  Quantises each W tile to FP8 in
+        registers using power-of-2 scaling, then performs two FP8 dot products.
+
+        Uses persistent tiling: each CTA loops over multiple output tiles
+        (stride ``num_programs``) to eliminate wave quantisation.
+
+        Side outputs (``SAVE_W_HI`` / ``SAVE_W_LO``): written from ``pid_m == 0``
+        CTAs only to avoid write-back races.  Each ``(N-block, K-block)`` tile is
+        owned by exactly one CTA with ``pid_m == 0`` for that ``pid_n``.
+
+        When ``HAS_ERROR`` is True, the kernel reads old quantisation error from
+        ``error_old_ptr`` and adds it to W before quantising.  The new error is
+        computed in Python after the kernel using the stored W_hi / W_lo outputs.
+
+        Computes::
+
+            out[m,n] = sum_{kb} sa[m,kb] * (
+                inv_hi[n,kb] * dot(A_kb, quant(W_hi_kb)^T)
+              + inv_lo[n,kb] * dot(A_kb, quant(W_lo_kb)^T)
+            )
+
+        where ``inv_hi`` / ``inv_lo`` are the power-of-2 quantisation scales
+        computed on-the-fly from the W tiles (no pre-computed scale inputs).
+        """
+        # ── Persistent tile loop setup ──
+        start_pid = tl.program_id(0)
+        num_m = tl.cdiv(M, BLOCK_M)
+        num_n = tl.cdiv(N, BLOCK_N)
+        num_tiles = num_m * num_n
+        num_programs = min(num_sms_launch, num_tiles)
+
+        tile_id = start_pid
+        while tile_id < num_tiles:
+            # ── GROUP_M tile mapping for L2 reuse ──
+            num_in_group = GROUP_M * num_n
+            group_id = tile_id // num_in_group
+            first_m = group_id * GROUP_M
+            group_m = min(num_m - first_m, GROUP_M)
+            pid_m = first_m + ((tile_id % num_in_group) % group_m)
+            pid_n = (tile_id % num_in_group) // group_m
+
+            # ── Tile-dependent offsets (recomputed per tile) ──
+            offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+            offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+            offs_k = tl.arange(0, BLOCK_K)
+
+            # Raw (unmasked) offsets for masking and side-output writes
+            offs_n_raw = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+            # ── Activation and weight base pointers (advanced each K-block) ──
+            a_ptrs = (
+                a_ptr
+                + offs_m[:, None] * stride_am
+                + offs_k[None, :] * stride_ak
+            )
+            # Load W as (BLOCK_N, BLOCK_K) for coalesced K-axis access
+            w_ptrs = (
+                w_ptr
+                + offs_n[:, None] * stride_wn
+                + offs_k[None, :] * stride_wk
+            )
+            if HAS_ERROR:
+                e_ptrs = (
+                    error_old_ptr
+                    + offs_n[:, None] * stride_eon
+                    + offs_k[None, :] * stride_eok
+                )
+
+            # ── Side-output base pointers (only initialised when needed) ──
+            if SAVE_W_HI:
+                w_hi_out_ptrs = (
+                    w_hi_out_ptr
+                    + offs_n_raw[:, None] * stride_who_n
+                    + offs_k[None, :] * stride_who_k
+                )
+            if SAVE_W_LO:
+                w_lo_out_ptrs = (
+                    w_lo_out_ptr
+                    + offs_n_raw[:, None] * stride_wlo_n
+                    + offs_k[None, :] * stride_wlo_k
+                )
+
+            # ── FP32 accumulator (re-initialised per tile) ──
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            n_mask_raw = offs_n_raw < N
+
+            # ── K-dimension loop (one scale block per iteration) ──
+            for kb in range(0, num_k_blocks):
+                k_mask = offs_k < (K - kb * BLOCK_K)
+
+                # 1. Load activation tile (FP8 E4M3)
+                a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+
+                # 2. Load W tile as (BLOCK_N, BLOCK_K) BF16 → FP32
+                w_f32 = tl.load(
+                    w_ptrs, mask=k_mask[None, :], other=0.0,
+                ).to(tl.float32)
+
+                # 3. Optional error feedback: w_corrected = w + old_error
+                if HAS_ERROR:
+                    old_err = tl.load(e_ptrs, mask=k_mask[None, :], other=0.0)
+                    w_f32 = w_f32 + old_err
+
+                # 4. Quantise W_hi — power-of-2 per-row scaling
+                amax_hi = tl.max(tl.abs(w_f32), axis=1)  # (BLOCK_N,)
+                amax_hi = tl.maximum(amax_hi, 1e-12)
+                raw_exp_hi = tl.ceil(tl.log2(amax_hi / FP8_MAX))
+                raw_exp_hi = tl.maximum(raw_exp_hi, -126.0)
+                inv_scale_hi = tl.exp2(raw_exp_hi)  # (BLOCK_N,) — IS sbhi
+
+                w_hi_scaled = w_f32 / inv_scale_hi[:, None]
+                w_hi_clamped = tl.maximum(
+                    tl.minimum(w_hi_scaled, FP8_MAX), -FP8_MAX
+                )
+                w_hi_nk = w_hi_clamped.to(w_hi_out_ptr.dtype.element_ty)
+
+                # 5. Compute residual in registers (no GMEM round-trip)
+                residual = (
+                    w_f32 - w_hi_nk.to(tl.float32) * inv_scale_hi[:, None]
+                )
+
+                # 6. Quantise W_lo — same scheme with zero-residual sentinel
+                amax_lo = tl.max(tl.abs(residual), axis=1)  # (BLOCK_N,)
+                zero_residual = amax_lo < 1e-12
+                amax_lo_safe = tl.maximum(amax_lo, 1e-12)
+                raw_exp_lo = tl.ceil(tl.log2(amax_lo_safe / FP8_MAX))
+                raw_exp_lo = tl.maximum(raw_exp_lo, -126.0)
+                inv_scale_lo = tl.exp2(raw_exp_lo)
+                # sblo = 0 for zero-residual blocks (matches sentinel -128)
+                sblo = tl.where(zero_residual, 0.0, inv_scale_lo)
+                safe_inv_scale_lo = tl.where(zero_residual, 1.0, inv_scale_lo)
+
+                w_lo_scaled = residual / safe_inv_scale_lo[:, None]
+                w_lo_clamped = tl.maximum(
+                    tl.minimum(w_lo_scaled, FP8_MAX), -FP8_MAX
+                )
+
+                if STOCHASTIC_LO:
+                    # Stochastic rounding for W_lo (SRR mode)
+                    rtn = w_lo_clamped.to(w_lo_out_ptr.dtype.element_ty)
+                    rtn_f = rtn.to(tl.float32)
+                    diff = w_lo_clamped - rtn_f
+                    direction = tl.where(diff >= 0, 1.0, -1.0)
+                    abs_rtn = tl.maximum(tl.abs(rtn_f), 1e-12)
+                    nudge = direction * abs_rtn * 0.25
+                    other = (rtn_f + nudge).to(w_lo_out_ptr.dtype.element_ty)
+                    other_f = other.to(tl.float32)
+                    gap = tl.maximum(tl.abs(other_f - rtn_f), 1e-45)
+                    frac = tl.minimum(tl.abs(diff) / gap, 1.0)
+                    sr_offsets = offs_n[:, None] * K + offs_k[None, :]
+                    rand = tl.rand(SRR_SEED, sr_offsets)
+                    boundary = tl.abs(other_f - rtn_f) < 1e-45
+                    exact = (tl.abs(diff) < 1e-45) | boundary
+                    w_lo_nk = tl.where(
+                        exact, rtn, tl.where(rand < frac, other, rtn)
+                    )
+                else:
+                    w_lo_nk = w_lo_clamped.to(w_lo_out_ptr.dtype.element_ty)
+
+                # 7. Side outputs (pid_m == 0 only — no write-back race)
+                if SAVE_W_HI and pid_m == 0:
+                    wh_mask = (offs_n_raw[:, None] < N) & (k_mask[None, :])
+                    tl.store(w_hi_out_ptrs, w_hi_nk, mask=wh_mask)
+                    tl.store(
+                        scales_whi_out_ptr
+                        + offs_n_raw * stride_swhi_n
+                        + kb * stride_swhi_kb,
+                        raw_exp_hi.to(tl.int8),
+                        mask=n_mask_raw,
+                    )
+                if SAVE_W_LO and pid_m == 0:
+                    wl_mask = (offs_n_raw[:, None] < N) & (k_mask[None, :])
+                    tl.store(w_lo_out_ptrs, w_lo_nk, mask=wl_mask)
+                    exp_lo_store = tl.where(zero_residual, -128.0, raw_exp_lo)
+                    tl.store(
+                        scales_wlo_out_ptr
+                        + offs_n_raw * stride_swlo_n
+                        + kb * stride_swlo_kb,
+                        exp_lo_store.to(tl.int8),
+                        mask=n_mask_raw,
+                    )
+
+                # 8. Dual dot products (transpose W tiles: (N,K) → (K,N))
+                w_hi_kn = tl.trans(w_hi_nk)  # (BLOCK_K, BLOCK_N) for dot
+                partial_hi = tl.dot(a, w_hi_kn, max_num_imprecise_acc=0)
+
+                # Load activation scale for this K-block
+                sa = tl.exp2(tl.load(
+                    scales_a_ptr + offs_m * stride_sa_m + kb * stride_sa_kb
+                ).to(tl.float32))  # (BLOCK_M,)
+
+                # Sparsity fast-path: skip W_lo dot when all sblo ≤ threshold
+                is_sparse = tl.max(sblo) <= SPARSE_THRESHOLD
+                if is_sparse:
+                    combined = partial_hi * inv_scale_hi[None, :]
+                else:
+                    w_lo_kn = tl.trans(w_lo_nk)  # (BLOCK_K, BLOCK_N)
+                    partial_lo = tl.dot(a, w_lo_kn, max_num_imprecise_acc=0)
+                    combined = (
+                        partial_hi * inv_scale_hi[None, :]
+                        + partial_lo * sblo[None, :]
+                    )
+
+                acc += combined * sa[:, None]
+
+                # 9. Advance K pointers
+                a_ptrs += BLOCK_K * stride_ak
+                w_ptrs += BLOCK_K * stride_wk
+                if HAS_ERROR:
+                    e_ptrs += BLOCK_K * stride_eok
+                if SAVE_W_HI:
+                    w_hi_out_ptrs += BLOCK_K * stride_who_k
+                if SAVE_W_LO:
+                    w_lo_out_ptrs += BLOCK_K * stride_wlo_k
+
+            # ── Store output (masked for partial tiles) ──
+            offs_om = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_on = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            out_ptrs = (
+                out_ptr
+                + offs_om[:, None] * stride_om
+                + offs_on[None, :] * stride_on
+            )
+            out_mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+            tl.store(out_ptrs, acc, mask=out_mask)
+
+            tile_id += num_programs
+
 except ImportError:
     pass
 
@@ -1821,6 +2144,180 @@ def fused_act_quant_dual_gemm_forward(
     if save_side_outputs:
         return output, act_fp8, act_scales
     return output, None, None
+
+
+def fused_wtquant_block_scaled_dual_gemm_forward(
+    act_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    act_scales: torch.Tensor,
+    block_size: int,
+    error_buf: torch.Tensor | None = None,
+    stochastic_lo: bool = False,
+    save_w_lo: bool = True,
+    sparse_threshold: float = 0.0,
+    persistent: bool = True,
+    launch_mult: int = 1,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Fused on-the-fly weight quantisation + block-scaled 2-GEMM forward.
+
+    Replaces the two-kernel pipeline ``fused_dual_quantize_fp8 + GEMM`` with a
+    single kernel pass: reads W_bf16 once, quantises W_hi and W_lo in registers,
+    and computes both FP8 dot products.  Eliminates the intermediate W_hi / W_lo
+    GMEM round-trip (~32 MB saved at 4K × 4K scale).
+
+    Side outputs (W_hi, W_hi scales, and optionally W_lo / W_lo scales) are
+    written to GMEM from ``pid_m == 0`` CTAs only — each (N-block, K-block) pair
+    is written exactly once, with no inter-CTA conflicts.
+
+    When ``error_buf`` is provided, the kernel reads old error and adds it to W
+    before quantising (in-kernel).  The new error is computed in Python after the
+    kernel using the returned W_hi / W_lo (same protocol as
+    :func:`fused_dual_quantize_fp8`).
+
+    Args:
+        act_fp8:     (M, K) FP8 E4M3 activations.
+        weight:      (N, K) BF16/FP32 weight matrix.
+        act_scales:  (K // block_size, M) int8 E8M0 activation scales.
+        block_size:  Scaling block size (= BLOCK_K in kernel; must divide K).
+        error_buf:   Optional (N, K) FP32 error-feedback buffer; modified
+                     in-place after the kernel.
+        stochastic_lo: Use stochastic rounding for W_lo (SRR mode).
+        save_w_lo:   Write W_lo + scales to GMEM for backward dX.  Set False
+                     for ABD mode (backward uses W_hi only).  Ignored when
+                     ``error_buf`` is not None (error update always needs W_lo).
+        sparse_threshold: Skip W_lo dot when max(sblo) ≤ threshold.
+        persistent:  Use persistent tiling.
+        launch_mult: CTAs per SM (1 or 2).
+
+    Returns:
+        ``(output, w_hi_fp8, w_lo_fp8_or_None, scales_whi, scales_wlo_or_None)``
+        where output is ``(M, N)`` FP32 and W_hi / W_lo are ``(N, K)`` FP8.
+    """
+    assert act_fp8.is_contiguous() and weight.is_contiguous(), (
+        "Activations and weight must be contiguous"
+    )
+    M, K = act_fp8.shape
+    N, K2 = weight.shape
+    assert K == K2, f"K mismatch: act ({K}) vs weight ({K2})"
+    assert K % block_size == 0, (
+        f"K ({K}) must be divisible by block_size ({block_size})"
+    )
+    if stochastic_lo and error_buf is not None:
+        raise ValueError(
+            "stochastic_lo and error_buf are mutually exclusive "
+            "(SRR eliminates the error-feedback buffer)"
+        )
+
+    num_kb = K // block_size
+
+    # When error feedback is active, W_lo must be written so the Python
+    # post-step can compute the new error (even in ABD mode).
+    actual_save_w_lo = save_w_lo or (error_buf is not None)
+
+    output = torch.empty((M, N), device=act_fp8.device, dtype=torch.float32)
+    w_hi_out = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
+    scales_whi_out = torch.empty((num_kb, N), device=weight.device, dtype=torch.int8)
+
+    if actual_save_w_lo:
+        w_lo_out = torch.empty((N, K), device=weight.device, dtype=torch.float8_e4m3fn)
+        scales_wlo_out = torch.empty(
+            (num_kb, N), device=weight.device, dtype=torch.int8
+        )
+    else:
+        # Dummy 1-element tensors — SAVE_W_LO=False compiles away all stores.
+        w_lo_out = torch.empty((1,), device=weight.device, dtype=torch.float8_e4m3fn)
+        scales_wlo_out = torch.empty((1,), device=weight.device, dtype=torch.int8)
+
+    has_error = error_buf is not None
+    # Clone for autotune safety: autotune reruns the kernel multiple times.
+    # The kernel only reads old_error; new error is computed outside.
+    error_old = error_buf.clone() if has_error else weight  # dummy when no error
+
+    srr_seed: int = int(
+        torch.randint(0, 2**31, (1,), device=weight.device).item()
+        if stochastic_lo
+        else 0
+    )
+
+    num_sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
+    num_sms_launch = num_sms * launch_mult if persistent else (1 << 30)
+
+    grid = lambda META: (  # noqa: E731
+        max(1, min(
+            num_sms_launch,
+            triton.cdiv(M, META["BLOCK_M"])  # pyright: ignore[reportPossiblyUnboundVariable]
+            * triton.cdiv(N, META["BLOCK_N"]),  # pyright: ignore[reportPossiblyUnboundVariable]
+        )),
+    )
+
+    _fused_wtquant_block_scaled_dual_gemm_kernel[grid](  # pyright: ignore[reportPossiblyUnboundVariable]
+        act_fp8,
+        weight,
+        error_old,
+        output,
+        w_hi_out,
+        w_lo_out,
+        scales_whi_out,
+        scales_wlo_out,
+        act_scales,
+        M, N, K, num_kb,
+        # A strides (FP8, (M, K) row-major)
+        act_fp8.stride(0),
+        act_fp8.stride(1),
+        # W strides ((N, K) row-major)
+        weight.stride(0),
+        weight.stride(1),
+        # Error-old strides (0 when HAS_ERROR=False — kernel ignores them)
+        error_old.stride(0) if has_error else 0,
+        error_old.stride(1) if has_error else 0,
+        # Output strides
+        output.stride(0),
+        output.stride(1),
+        # W_hi side-output strides ((N, K) row-major)
+        w_hi_out.stride(0),
+        w_hi_out.stride(1),
+        # W_lo side-output strides (dummy-safe: stride(-1) valid for 1D/2D)
+        w_lo_out.stride(0),
+        w_lo_out.stride(-1),
+        # W_hi scale strides ((num_kb, N) layout)
+        scales_whi_out.stride(1),   # stride_swhi_n: N-dim stride
+        scales_whi_out.stride(0),   # stride_swhi_kb: kb-dim stride
+        # W_lo scale strides (dummy-safe)
+        scales_wlo_out.stride(-1),  # stride_swlo_n
+        scales_wlo_out.stride(0),   # stride_swlo_kb
+        # Activation-scale strides ((num_kb, M) layout)
+        act_scales.stride(1),       # stride_sa_m: M-dim stride
+        act_scales.stride(0),       # stride_sa_kb: kb-dim stride
+        srr_seed,
+        FP8_MAX=_FP8_E4M3_MAX,
+        BLOCK_K=block_size,
+        SPARSE_THRESHOLD=sparse_threshold,
+        HAS_ERROR=has_error,
+        SAVE_W_HI=True,
+        SAVE_W_LO=actual_save_w_lo,
+        STOCHASTIC_LO=stochastic_lo,
+        num_sms_launch=num_sms_launch,
+    )
+
+    # Post-step: compute new error = weight - dequant(W_hi) - dequant(W_lo).
+    # Done outside the kernel to avoid Triton cast-folding issues (same as
+    # fused_dual_quantize_fp8).
+    if has_error:
+        w_hi_deq = block_dequantize_fp8(w_hi_out, scales_whi_out, block_size)
+        w_lo_deq = block_dequantize_fp8(w_lo_out, scales_wlo_out, block_size)
+        error_buf.copy_(  # type: ignore[union-attr]
+            weight.float() - w_hi_deq - w_lo_deq
+        )
+
+    if save_w_lo:
+        return output, w_hi_out, w_lo_out, scales_whi_out, scales_wlo_out
+    return output, w_hi_out, None, scales_whi_out, None
 
 
 def fused_block_scaled_backward_dx(
