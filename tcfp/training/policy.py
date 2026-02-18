@@ -395,6 +395,7 @@ class MomentumAlignmentState:
         resets_applied: Number of EF buffer resets applied.
         promoted_to_srr: Whether this layer has been promoted to SRR.
         promoted_to_highway: Whether this layer has been promoted to highway.
+        promoted_to_bf16: Whether this layer has been fallen back to BF16.
     """
 
     layer_name: str
@@ -405,6 +406,7 @@ class MomentumAlignmentState:
     resets_applied: int = field(default=0)
     promoted_to_srr: bool = field(default=False)
     promoted_to_highway: bool = field(default=False)
+    promoted_to_bf16: bool = field(default=False)
 
 
 class MomentumAlignmentTracker:
@@ -461,6 +463,7 @@ class MomentumAlignmentTracker:
         reset_after: int = 100,
         srr_after: int = 200,
         highway_after: int = 500,
+        bf16_fallback_after: int = 1000,
         magnitude_gate: float = 0.05,
     ) -> None:
         self.optimizer = optimizer
@@ -470,6 +473,7 @@ class MomentumAlignmentTracker:
         self.reset_after = reset_after
         self.srr_after = srr_after
         self.highway_after = highway_after
+        self.bf16_fallback_after = bf16_fallback_after
         self.magnitude_gate = magnitude_gate
         self._states: dict[str, MomentumAlignmentState] = {}
         self._step: int = 0
@@ -507,6 +511,11 @@ class MomentumAlignmentTracker:
             if not isinstance(module, TCFPLinear):
                 continue
             if getattr(module, "_is_highway", False):
+                # Skip manually designated highways (from apply_highway_routing),
+                # but allow EFMA-promoted highways through for BF16 escalation.
+                if name not in self._states or not self._states[name].promoted_to_highway:
+                    continue
+            if getattr(module, "_bf16_fallback", False):
                 continue
             if module._error_state is None:
                 # SRR mode — no EF buffer, no drag possible.
@@ -543,9 +552,9 @@ class MomentumAlignmentTracker:
     def drag_layers(self) -> list[str]:
         """Layer names currently in the drag regime (alignment_ema < drag_threshold).
 
-        Excludes layers that have been promoted to SRR or highway, even if their
-        stale ``alignment_ema`` is still negative (those layers no longer receive
-        EMA updates and are no longer managed by this tracker).
+        Excludes layers that have been promoted to SRR, highway, or BF16
+        fallback, even if their stale ``alignment_ema`` is still negative
+        (those layers no longer receive EMA updates or are terminal).
         """
         return [
             name
@@ -553,6 +562,7 @@ class MomentumAlignmentTracker:
             if state.alignment_ema < self.drag_threshold
             and not state.promoted_to_srr
             and not state.promoted_to_highway
+            and not state.promoted_to_bf16
         ]
 
     def _get_alignment(
@@ -584,8 +594,9 @@ class MomentumAlignmentTracker:
         e_flat = ef_buffer.flatten().float()
         m_norm = m_flat.norm()
         e_norm = e_flat.norm()
-        # Gate: if EF is tiny relative to momentum, drag force is negligible.
-        if m_norm < 1e-12 or e_norm < self.magnitude_gate * m_norm:
+        # Gate: if either norm is degenerate or EF is tiny relative to momentum,
+        # drag force is negligible — return neutral alignment.
+        if m_norm < 1e-12 or e_norm < 1e-12 or e_norm < self.magnitude_gate * m_norm:
             return 0.0
         return (torch.dot(m_flat, e_flat) / (m_norm * e_norm)).item()
 
@@ -603,6 +614,18 @@ class MomentumAlignmentTracker:
           3. EF Reset: drag_steps >= reset_after AND checks_since_reset >= reset_after.
         All actions reset drag_steps, checks_since_reset, and alignment_ema to 0.
         """
+        # Level 4 — BF16 fallback (terminal: no quantisation at all)
+        if (
+            state.promoted_to_highway
+            and state.drag_steps >= self.bf16_fallback_after
+        ):
+            module.fallback_to_bf16()
+            state.promoted_to_bf16 = True
+            state.drag_steps = 0
+            state.checks_since_reset = 0
+            state.alignment_ema = 0.0
+            return
+
         # Level 3 — direct highway promotion (bypasses SRR when highway_after < srr_after)
         if not state.promoted_to_highway and state.drag_steps >= self.highway_after:
             module.abd = False

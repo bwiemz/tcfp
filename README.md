@@ -215,6 +215,37 @@ from tcfp.nn import TCFPLinear
 layer = TCFPLinear(1024, 4096, use_tensor_cores=True).cuda()
 ```
 
+### Pre-Training Diagnostic
+
+Check model compatibility before converting:
+
+```python
+from tcfp.nn import diagnose
+
+report = diagnose(model, scale_block_size=64)
+print(f"{report.tc_eligible_layers}/{report.total_linear_layers} layers TC-eligible")
+print(f"VRAM: {report.vram_fp32_bytes/1e9:.1f} GB FP32 → {report.vram_fp8_bytes/1e9:.1f} GB FP8")
+print(f"EF overhead: {report.vram_ef_overhead_bytes/1e6:.0f} MB")
+print(f"Savings: {report.estimated_savings_pct:.0f}%")
+
+# Per-layer details
+for layer in report.layer_details:
+    if layer.fallback_reason:
+        print(f"  {layer.name}: {layer.fallback_reason}")
+```
+
+### Inference Export
+
+Strip TCFP wrappers back to vanilla PyTorch modules for deployment:
+
+```python
+from tcfp.nn import export
+
+# After training, convert back to standard nn.Linear / nn.LayerNorm / nn.Embedding
+export(model)  # in-place, shares weight tensors (no copy)
+torch.save(model.state_dict(), "model.pt")
+```
+
 ---
 
 ## Configuration Reference
@@ -235,6 +266,13 @@ All flags are available on both `convert_to_tcfp()` and `TCFPLinear(...)`.
 
 **Mutual exclusions:** `srr` and `delayed_scaling` cannot be combined (SRR requires no
 error state). Both `srr` and `abd` require `use_tensor_cores=True`.
+
+**Runtime methods on `TCFPLinear`:**
+
+| Method | Effect |
+|--------|--------|
+| `fallback_to_bf16()` | Switch to BF16 pass-through (skip all quantisation) |
+| `restore_tcfp()` | Restore TCFP quantisation after a BF16 fallback |
 
 ### Dispatch Priority
 
@@ -281,6 +319,61 @@ blocks use a sentinel value (int8 −128) detected and skipped by the GEMM kerne
 
 ---
 
+## Training Integration
+
+### Gradient Checkpointing
+
+TCFP is compatible with `torch.utils.checkpoint`. The error feedback buffer is
+automatically protected from double-update during checkpoint recomputation:
+
+```python
+import torch.utils.checkpoint
+
+# Works correctly — EF is updated once, not twice
+out = torch.utils.checkpoint.checkpoint(tcfp_layer, x, use_reentrant=False)
+```
+
+### Gradient Accumulation
+
+During multi-micro-batch accumulation, EF is updated only once per optimizer step.
+TCFP tracks `weight._version` internally — subsequent forwards with unchanged weights
+skip redundant quantisation and EF writes automatically:
+
+```python
+for micro_batch in micro_batches:
+    loss = model(micro_batch).sum()
+    loss.backward()                  # EF updated on first forward only
+optimizer.step()                     # weight changes → next forward updates EF
+optimizer.zero_grad()
+```
+
+### torch.compile
+
+`TCFPLinear.forward` is decorated with `@torch.compiler.disable` to prevent
+miscompilation from dict mutation, conditional dispatch, and step counters. The
+surrounding model can still be compiled — only the TCFP forward is excluded from
+graph tracing:
+
+```python
+model = torch.compile(model, backend="inductor")  # safe — TCFP layers opt out
+```
+
+### Runtime BF16 Fallback
+
+Individual layers can be switched to BF16 pass-through at any point during training,
+useful for recovering divergent layers:
+
+```python
+layer.fallback_to_bf16()   # skip all quantisation, use F.linear directly
+layer.restore_tcfp()       # resume TCFP quantisation
+```
+
+The EFMA policy (`MomentumAlignmentTracker`) can escalate to BF16 fallback
+automatically as Level 4 — the terminal intervention when a layer shows persistent
+quantisation drag even after highway promotion.
+
+---
+
 ## Project Structure
 
 ```
@@ -293,11 +386,12 @@ tcfp/
 ├── csrc/            C++ source: fused dual FP8 GEMM via cuBLASLt beta=1
 ├── tcfp12/          Fake-quantize path (FP8 + 4-bit NF4 residual, F.linear)
 ├── nn/              Drop-in modules: TCFPLinear, TCFPLayerNorm, TCFPEmbedding,
-│                    convert_to_tcfp, autograd functions for all GEMM paths
+│                    convert_to_tcfp, diagnose, export; autograd functions
+│                    for all GEMM paths
 └── training/        Training utilities: checkpointing, monitoring, phase
                      detection, progressive quantization, layer policies
 
-tests/               413 tests (397 passed, 16 skipped on CPU-only)
+tests/               436 tests (420 passed, 16 skipped on CPU-only)
 benchmarks/          Throughput, VRAM, and convergence benchmarks
 examples/            TinyGPT and MNIST convergence validation scripts
 ```
@@ -310,7 +404,7 @@ examples/            TinyGPT and MNIST convergence validation scripts
 py -m pytest tests/ -v
 ```
 
-Expected output: **397 passed, 16 skipped** (CUDA-only tests skipped on CPU-only machines).
+Expected output: **420 passed, 16 skipped** (CUDA-only tests skipped on CPU-only machines).
 
 ## Running Benchmarks
 
@@ -344,17 +438,20 @@ py -m examples.train_convergence
 ## Status and Limitations
 
 **Current capabilities:**
-- Matches BF16 convergence on TinyGPT (PPL ratio 1.002–1.003×)
-- Faster than BF16 end-to-end: TCFP-12 TC runs at 1.19× BF16 speed (13.28ms vs 15.82ms)
+- Matches BF16 convergence on TinyGPT (PPL ratio 1.002-1.003x)
+- Faster than BF16 end-to-end: TCFP-12 TC runs at 1.19x BF16 speed (13.28ms vs 15.82ms)
 - 22% less weight VRAM than BF16 at any model size
 - SRR eliminates the error feedback buffer entirely (saves 26 GB at 7B scale)
 - ABD saves ~20% of backward GEMMs with no quality loss
+- Compatible with `torch.utils.checkpoint`, gradient accumulation, and `torch.compile`
+- Pre-training diagnostic (`diagnose()`) and inference export (`export()`)
+- Runtime BF16 fallback for individual layers, with EFMA-driven auto-escalation
 
 **Current limitations:**
 - **Single-GPU only** — not validated with FSDP, tensor parallelism, or pipeline parallelism
 - **No framework integration** — requires manual `convert_to_tcfp()` call; no HuggingFace or DeepSpeed plug-in
 - **Research scale only** — validated at TinyGPT (4-layer, d=256); not yet tested at 7B+
-- **Per-block path still slower** — block-scaled kernels are 7–14% slower than BF16 (Block-64: 17.01ms, Block-32: 18.11ms vs BF16 15.82ms)
+- **Per-block path still slower** — block-scaled kernels are 7-14% slower than BF16 (Block-64: 17.01ms, Block-32: 18.11ms vs BF16 15.82ms)
 
 ---
 

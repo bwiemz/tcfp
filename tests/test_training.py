@@ -1069,3 +1069,74 @@ class TestMomentumAlignmentTracker:
         # Highway layer should not appear in result
         assert "0" not in result
         assert tracker.get_state("0") is None
+
+
+class TestEFMABF16Fallback:
+    """Level 4 BF16 fallback via EFMA."""
+
+    def test_efma_bf16_fallback(self) -> None:
+        """Level 4: after highway promotion + sustained drag → BF16 fallback."""
+        model, opt = _make_tracker_model()
+        m = list(model.modules())[1]
+        assert isinstance(m, TCFPLinear)
+
+        # Need optimizer state populated for alignment computation
+        opt.step()
+
+        w_shape = m.weight.shape
+
+        tracker = MomentumAlignmentTracker(
+            opt,
+            drag_threshold=-0.1,
+            check_interval=1,
+            reset_after=9999,  # disable lower-level resets
+            srr_after=9999,
+            highway_after=9999,
+            bf16_fallback_after=3,
+            magnitude_gate=0.0,
+            ema_decay=0.0,
+        )
+
+        # Pre-set state as if highway promotion already happened (Level 3).
+        # Level 3 sets both _is_highway on the module and promoted_to_highway
+        # in the state. The step() method now allows EFMA-promoted highways
+        # through for BF16 escalation.
+        from tcfp.training.policy import MomentumAlignmentState
+
+        m._is_highway = True  # type: ignore[attr-defined]
+        state = MomentumAlignmentState(
+            layer_name="0",
+            promoted_to_highway=True,
+        )
+        tracker._states["0"] = state
+
+        # Force anti-alignment: momentum opposite to EF
+        ef = m._error_state
+        assert ef is not None
+        ef._buffers[m._param_name] = torch.ones(w_shape)
+        opt.state[m.weight]["exp_avg"] = -torch.ones(w_shape)
+
+        # Run enough steps for bf16_fallback_after threshold
+        for _ in range(10):
+            tracker.step(model)
+            if m._bf16_fallback:
+                break
+
+        state = tracker.get_state("0")
+        assert state is not None
+        assert state.promoted_to_bf16, "Layer should have been fallen back to BF16"
+        assert m._bf16_fallback
+
+    def test_efma_skip_bf16_layers(self) -> None:
+        """BF16-fallback layers are excluded from alignment tracking."""
+        model, opt = _make_tracker_model()
+        m = list(model.modules())[1]
+        assert isinstance(m, TCFPLinear)
+        m.fallback_to_bf16()
+
+        opt.step()
+
+        tracker = MomentumAlignmentTracker(opt, check_interval=1)
+        result = tracker.step(model)
+        # BF16-fallback layer should not appear in result
+        assert "0" not in result

@@ -13,6 +13,7 @@ on every forward pass, then use FP8 tensor cores for the matmul.
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -335,6 +336,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         use_cuda_ext: bool = True,
         abd: bool = False,
         srr: bool = False,
+        update_ef: bool = True,
     ) -> torch.Tensor:
         # --- 1. Error feedback on weight ---
         w = weight.float()
@@ -368,7 +370,10 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)
 
         # --- 4. Error feedback: store total quantisation error ---
-        if error_state is not None:
+        # Guard: skip during checkpoint recomputation or gradient accumulation.
+        # update_ef is False when weight hasn't changed or we're in no_grad
+        # context (checked in TCFPLinear.forward, before Function.apply).
+        if error_state is not None and update_ef:
             w_reconstructed = (
                 w_hi_fp8.float() * w_hi_inv + w_lo_fp8.float() * w_lo_inv
             )
@@ -460,6 +465,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor | None,
         None, None, None, None, None, None, None, None, None, None, None,
+        None,
     ]:
         saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
         has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
@@ -554,6 +560,7 @@ class _TCFP12TensorCoreFunction(torch.autograd.Function):
             grad_weight,
             grad_bias,
             None, None, None, None, None, None, None, None, None, None, None,
+            None,  # update_ef
         )
 
 
@@ -582,12 +589,21 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         param_name: str,
         abd: bool = False,
         srr: bool = False,
+        update_ef: bool = True,
     ) -> torch.Tensor:
         # --- 1. Get error-feedback buffer (lazy-allocated, FP32) ---
         error_buf: torch.Tensor | None = None
         if error_state is not None:
             # get_error creates buffer with same dtype as `like` — must be FP32
             error_buf = error_state.get_error(param_name, weight.float())
+            # During checkpoint recomputation (no_grad) or gradient
+            # accumulation (weight unchanged) or checkpoint recomputation,
+            # clone the buffer so the kernel reads the correct old-error
+            # but writes to a disposable copy — prevents double-update.
+            # update_ef incorporates both version check and grad context
+            # (checked in TCFPLinear.forward, before Function.apply).
+            if not update_ef:
+                error_buf = error_buf.clone()
 
         # --- 2. Flatten input to 2D ---
         input_shape = input.shape
@@ -679,6 +695,7 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor | None,
         None, None, None, None, None, None,
+        None,
     ]:
         saved = ctx.saved_tensors  # pyright: ignore[reportAttributeAccessIssue]
         has_bias: bool = ctx.has_bias  # pyright: ignore[reportAttributeAccessIssue]
@@ -738,6 +755,7 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
             grad_weight,
             grad_bias,
             None, None, None, None, None, None,
+            None,  # update_ef
         )
 
 
@@ -921,6 +939,8 @@ class TCFPLinear(nn.Module):
         if use_tensor_cores and error_feedback and not srr:
             self._error_state = ErrorFeedbackState()
         self._param_name: str = ""
+        self._last_weight_version: int = -1
+        self._bf16_fallback: bool = False
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -937,7 +957,20 @@ class TCFPLinear(nn.Module):
             bound = 1 / fan_in**0.5
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def fallback_to_bf16(self) -> None:
+        """Switch this layer to BF16 pass-through (skip all quantisation)."""
+        self._bf16_fallback = True
+
+    def restore_tcfp(self) -> None:
+        """Restore TCFP quantisation after a BF16 fallback."""
+        self._bf16_fallback = False
+
+    @torch.compiler.disable  # type: ignore[attr-defined]
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # BF16 fallback — bypass all quantisation
+        if self._bf16_fallback:
+            return F.linear(x, self.weight, self.bias)
+
         # During warmup, skip quantisation entirely
         if self._warmup_remaining > 0:
             self._warmup_remaining -= 1
@@ -945,6 +978,19 @@ class TCFPLinear(nn.Module):
 
         # Tensor core path: real FP8 GEMMs via torch._scaled_mm
         if self.use_tensor_cores:
+            # Skip EF update when weight hasn't changed (gradient
+            # accumulation: multiple micro-batches per optimizer step)
+            # or during checkpoint recomputation (no_grad context).
+            # NOTE: torch.is_grad_enabled() must be checked HERE, not inside
+            # the autograd Function's forward, because PyTorch always disables
+            # gradients inside Function.forward().
+            ver = self.weight._version  # pyright: ignore[reportAttributeAccessIssue]
+            update_ef = (
+                ver != self._last_weight_version and torch.is_grad_enabled()
+            )
+            if update_ef:
+                self._last_weight_version = ver
+
             if self.mode == TCFPMode.TCFP12 and self.scale_block_size is not None:
                 result: torch.Tensor = _TCFP12BlockScaledFunction.apply(  # pyright: ignore[reportAssignmentType]
                     x,
@@ -956,6 +1002,7 @@ class TCFPLinear(nn.Module):
                     self._param_name,
                     self.abd,
                     self.srr,
+                    update_ef,
                 )
             else:
                 result = _TCFP12TensorCoreFunction.apply(  # pyright: ignore[reportAssignmentType]
@@ -973,6 +1020,7 @@ class TCFPLinear(nn.Module):
                     self.use_cuda_ext,
                     self.abd,
                     self.srr,
+                    update_ef,
                 )
             return result
 
@@ -1022,6 +1070,8 @@ class TCFPLinear(nn.Module):
             parts.append("srr=True")
         if self._warmup_steps > 0:
             parts.append(f"warmup_steps={self._warmup_steps}")
+        if self._bf16_fallback:
+            parts.append("bf16_fallback=True")
         return ", ".join(parts)
 
 
@@ -1295,5 +1345,215 @@ def convert_to_tcfp(
             )
             new_module.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
             setattr(model, name, new_module)
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Preflight Diagnostic
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LayerDiagnostic:
+    """Diagnostic information for a single linear layer."""
+
+    name: str
+    in_features: int
+    out_features: int
+    tc_eligible: bool
+    block_scale_eligible: bool
+    weight_bytes_fp32: int
+    weight_bytes_fp8: int
+    ef_buffer_bytes: int
+    fallback_reason: str | None
+
+
+@dataclass
+class DiagnosticReport:
+    """Complete model diagnostic report from :func:`diagnose`."""
+
+    total_linear_layers: int
+    tc_eligible_layers: int
+    block_scale_eligible_layers: int
+    fallback_layers: int
+    total_params: int
+    vram_fp32_bytes: int
+    vram_fp8_bytes: int
+    vram_ef_overhead_bytes: int
+    estimated_savings_pct: float
+    layer_details: list[LayerDiagnostic] = field(default_factory=list)
+
+
+def diagnose(
+    model: nn.Module,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    scale_block_size: int | None = None,
+    skip_patterns: tuple[str, ...] = ("head",),
+) -> DiagnosticReport:
+    """Run preflight diagnostics on a model before TCFP conversion.
+
+    Walks the module tree, identifies all ``nn.Linear`` layers, checks
+    dimension compatibility for tensor-core and block-scaled paths, and
+    estimates VRAM savings.
+
+    Args:
+        model: Model to diagnose (unconverted ``nn.Module``).
+        block_size: Block size for quantisation compatibility check.
+        scale_block_size: Block size for per-block scaling compatibility.
+        skip_patterns: Layer name patterns to skip (kept in FP32).
+
+    Returns:
+        :class:`DiagnosticReport` with per-layer details and aggregates.
+    """
+    layers: list[LayerDiagnostic] = []
+    total_fp32 = 0
+    total_fp8 = 0
+    total_ef = 0
+    total_params = 0
+    tc_count = 0
+    bs_count = 0
+    fallback_count = 0
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(pat in name for pat in skip_patterns):
+            continue
+
+        inf, outf = module.in_features, module.out_features
+        n_params = inf * outf
+        total_params += n_params
+
+        # FP32 baseline: 4 bytes per parameter
+        fp32_bytes = n_params * 4
+        total_fp32 += fp32_bytes
+
+        # TC eligibility: both dims divisible by 16
+        tc_ok = inf % 16 == 0 and outf % 16 == 0
+        if tc_ok:
+            tc_count += 1
+
+        # Block-scale eligibility
+        bs_ok = False
+        if scale_block_size is not None:
+            bs_ok = (
+                inf % scale_block_size == 0
+                and outf % scale_block_size == 0
+            )
+            if bs_ok:
+                bs_count += 1
+
+        # Determine fallback reason
+        reason: str | None = None
+        if inf % block_size != 0:
+            reason = f"in_features ({inf}) not divisible by block_size ({block_size})"
+            fallback_count += 1
+        elif not tc_ok:
+            reason = (
+                f"dims ({inf}, {outf}) not divisible by 16 "
+                f"(falls back to fake-quantise)"
+            )
+            fallback_count += 1
+
+        # FP8 cost: W_hi (1B) + W_lo (1B) = 2 bytes per param
+        fp8_bytes = n_params * 2
+        total_fp8 += fp8_bytes
+
+        # EF buffer: FP32 (4 bytes per param), only for TC+EF layers
+        ef_bytes = n_params * 4 if tc_ok else 0
+        total_ef += ef_bytes
+
+        layers.append(
+            LayerDiagnostic(
+                name=name,
+                in_features=inf,
+                out_features=outf,
+                tc_eligible=tc_ok,
+                block_scale_eligible=bs_ok,
+                weight_bytes_fp32=fp32_bytes,
+                weight_bytes_fp8=fp8_bytes,
+                ef_buffer_bytes=ef_bytes,
+                fallback_reason=reason,
+            )
+        )
+
+    # Savings: FP32 weights → FP8 dual weights + EF buffers
+    # Net savings = FP32 - (FP8 + EF)
+    fp8_total = total_fp8 + total_ef
+    savings_pct = (
+        (total_fp32 - fp8_total) / total_fp32 * 100.0
+        if total_fp32 > 0
+        else 0.0
+    )
+
+    return DiagnosticReport(
+        total_linear_layers=len(layers),
+        tc_eligible_layers=tc_count,
+        block_scale_eligible_layers=bs_count,
+        fallback_layers=fallback_count,
+        total_params=total_params,
+        vram_fp32_bytes=total_fp32,
+        vram_fp8_bytes=total_fp8,
+        vram_ef_overhead_bytes=total_ef,
+        estimated_savings_pct=savings_pct,
+        layer_details=layers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inference Export
+# ---------------------------------------------------------------------------
+
+
+def export(model: nn.Module) -> nn.Module:
+    """Strip TCFP wrappers, returning vanilla PyTorch modules.
+
+    Replaces:
+      - ``TCFPLinear``    -> ``nn.Linear``
+      - ``TCFPLayerNorm`` -> ``nn.LayerNorm``
+      - ``TCFPEmbedding`` -> ``nn.Embedding``
+
+    Parameters are **shared** (not copied) — the returned model references
+    the same underlying tensors.  Modified in-place and returned.
+
+    Args:
+        model: TCFP model to export.
+
+    Returns:
+        Model with all TCFP modules replaced by standard equivalents.
+    """
+    for name, module in list(model.named_children()):
+        # Recurse first (depth-first, same as convert_to_tcfp)
+        export(module)
+
+        if isinstance(module, TCFPLinear):
+            vanilla = nn.Linear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+            )
+            vanilla.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
+            if module.bias is not None:
+                vanilla.bias = module.bias  # pyright: ignore[reportAttributeAccessIssue]
+            setattr(model, name, vanilla)
+
+        elif isinstance(module, TCFPLayerNorm):
+            vanilla = nn.LayerNorm(
+                module.normalized_shape,
+                eps=module.eps,
+            )
+            vanilla.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
+            vanilla.bias = module.bias  # pyright: ignore[reportAttributeAccessIssue]
+            setattr(model, name, vanilla)
+
+        elif isinstance(module, TCFPEmbedding):
+            vanilla = nn.Embedding(
+                module.num_embeddings,
+                module.embedding_dim,
+                padding_idx=module.padding_idx,
+            )
+            vanilla.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]
+            setattr(model, name, vanilla)
 
     return model

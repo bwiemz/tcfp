@@ -12,6 +12,8 @@ from tcfp.nn import (
     TCFPLayerNorm,
     TCFPLinear,
     convert_to_tcfp,
+    diagnose,
+    export,
     ste_fake_quantize,
 )
 
@@ -274,3 +276,178 @@ class TestLazyEmbedding:
         loss = out.sum()
         loss.backward()
         assert emb.weight.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: torch.compile
+# ---------------------------------------------------------------------------
+
+
+class TestCompile:
+    def test_compile_does_not_trace(self) -> None:
+        """torch.compile should treat TCFPLinear as opaque (no graph breaks)."""
+        layer = TCFPLinear(128, 64, mode=TCFPMode.TCFP12).to(DEVICE)
+        compiled = torch.compile(layer, backend="eager")
+        x = torch.randn(4, 128, device=DEVICE)
+        out = compiled(x)
+        assert out.shape == (4, 64)
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: BF16 Fallback
+# ---------------------------------------------------------------------------
+
+
+class TestBF16Fallback:
+    def test_bf16_fallback_output(self) -> None:
+        """After fallback_to_bf16(), output matches F.linear exactly."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=True,
+        ).to(DEVICE)
+        layer._param_name = "test"
+        x = torch.randn(4, 128, device=DEVICE)
+
+        layer.fallback_to_bf16()
+        out = layer(x)
+        ref = torch.nn.functional.linear(x, layer.weight, layer.bias)
+        assert torch.equal(out, ref)
+
+    def test_restore_tcfp(self) -> None:
+        """After restore_tcfp(), quantisation resumes."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=True,
+        ).to(DEVICE)
+        layer._param_name = "test"
+        x = torch.randn(4, 128, device=DEVICE)
+
+        # Go to BF16 and back
+        layer.fallback_to_bf16()
+        assert layer._bf16_fallback
+        layer.restore_tcfp()
+        assert not layer._bf16_fallback
+
+        # Forward should now use quantisation (output differs from F.linear)
+        out_tcfp = layer(x)
+        ref_bf16 = torch.nn.functional.linear(x, layer.weight, layer.bias)
+        # They should NOT be exactly equal (quantisation changes output)
+        assert not torch.equal(out_tcfp, ref_bf16)
+
+    def test_bf16_fallback_no_ef_mutation(self) -> None:
+        """EF buffer untouched during BF16 fallback."""
+        layer = TCFPLinear(
+            128, 64, use_tensor_cores=True, error_feedback=True,
+        ).to(DEVICE)
+        layer._param_name = "test"
+
+        # Prime EF
+        x0 = torch.randn(4, 128, device=DEVICE, requires_grad=True)
+        layer(x0).sum().backward()
+        ef_before = layer._error_state._buffers["test"].clone()
+
+        # BF16 fallback — EF should not change
+        layer.fallback_to_bf16()
+        x1 = torch.randn(4, 128, device=DEVICE, requires_grad=True)
+        layer(x1).sum().backward()
+
+        ef_after = layer._error_state._buffers["test"]
+        assert torch.equal(ef_before, ef_after)
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Preflight Diagnostic
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnose:
+    def test_diagnose_basic(self) -> None:
+        """Simple model: layer counts correct."""
+        model = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+        )
+        report = diagnose(model)
+        assert report.total_linear_layers == 2
+        assert report.total_params == 128 * 64 + 64 * 32
+
+    def test_diagnose_tc_eligibility(self) -> None:
+        """Mix of TC-eligible and non-eligible layers."""
+        model = nn.Sequential(
+            nn.Linear(128, 64),   # TC-eligible (both div by 16)
+            nn.Linear(100, 50),   # NOT TC-eligible (100 % 16 != 0)
+        )
+        report = diagnose(model)
+        assert report.tc_eligible_layers == 1
+        assert report.fallback_layers == 1
+
+    def test_diagnose_skip_patterns(self) -> None:
+        """Layers matching skip_patterns are excluded."""
+        model = nn.ModuleDict({
+            "encoder": nn.Linear(128, 64),
+            "head": nn.Linear(64, 10),
+        })
+        report = diagnose(model, skip_patterns=("head",))
+        assert report.total_linear_layers == 1
+
+    def test_diagnose_vram_estimate(self) -> None:
+        """Byte calculations are correct."""
+        model = nn.Sequential(nn.Linear(128, 64))
+        report = diagnose(model)
+        n = 128 * 64
+        assert report.vram_fp32_bytes == n * 4
+        assert report.vram_fp8_bytes == n * 2  # W_hi + W_lo
+        assert report.vram_ef_overhead_bytes == n * 4  # EF buffer
+        # Savings: FP32(4B) → FP8(2B) + EF(4B) = net -2B (negative savings)
+        # Actually: savings = (4N - (2N + 4N)) / 4N = -50%
+        assert report.estimated_savings_pct < 0
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: Inference Export
+# ---------------------------------------------------------------------------
+
+
+class TestExport:
+    def test_export_replaces_modules(self) -> None:
+        """After export, no TCFP modules remain."""
+        model = nn.Sequential(
+            TCFPLinear(128, 64),
+            TCFPLayerNorm(64),
+            TCFPLinear(64, 32),
+        )
+        export(model)
+        for _name, mod in model.named_modules():
+            assert not isinstance(mod, (TCFPLinear, TCFPLayerNorm, TCFPEmbedding))
+
+    def test_export_preserves_weights(self) -> None:
+        """Weight tensors are shared (same data_ptr)."""
+        layer = TCFPLinear(128, 64)
+        w_ptr = layer.weight.data_ptr()
+        model = nn.Sequential(layer)
+        export(model)
+        exported_layer = model[0]
+        assert exported_layer.weight.data_ptr() == w_ptr
+
+    def test_export_output_matches(self) -> None:
+        """Exported model output matches F.linear."""
+        model = nn.Sequential(TCFPLinear(128, 64))
+        model.to(DEVICE)
+        w = model[0].weight.clone()
+        b = model[0].bias.clone() if model[0].bias is not None else None
+        export(model)
+        x = torch.randn(4, 128, device=DEVICE)
+        out = model(x)
+        ref = torch.nn.functional.linear(x, w, b)
+        assert torch.equal(out, ref)
+
+    def test_export_roundtrip(self) -> None:
+        """convert_to_tcfp then export gives same weights as original."""
+        model = nn.Sequential(nn.Linear(128, 64), nn.Linear(64, 32))
+        w0 = model[0].weight.data_ptr()
+        w1 = model[1].weight.data_ptr()
+        convert_to_tcfp(model)
+        export(model)
+        assert model[0].weight.data_ptr() == w0
+        assert model[1].weight.data_ptr() == w1
+        assert isinstance(model[0], nn.Linear)
+        assert not isinstance(model[0], TCFPLinear)
