@@ -1448,7 +1448,10 @@ try:
                     other_f = other.to(tl.float32)
                     gap = tl.maximum(tl.abs(other_f - rtn_f), 1e-45)
                     frac = tl.minimum(tl.abs(diff) / gap, 1.0)
-                    sr_offsets = offs_n[:, None] * K + offs_k[None, :]
+                    # Use absolute K position so each element gets a unique
+                    # seed across K-blocks (offs_k is relative, 0..BLOCK_K-1)
+                    offs_k_abs = kb * BLOCK_K + offs_k
+                    sr_offsets = offs_n[:, None] * K + offs_k_abs[None, :]
                     rand = tl.rand(SRR_SEED, sr_offsets)
                     boundary = tl.abs(other_f - rtn_f) < 1e-45
                     exact = (tl.abs(diff) < 1e-45) | boundary

@@ -657,13 +657,15 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
         ctx.has_bias = bias is not None  # pyright: ignore[reportAttributeAccessIssue]
         ctx.scale_block_size = scale_block_size  # pyright: ignore[reportAttributeAccessIssue]
         ctx.abd = abd  # pyright: ignore[reportAttributeAccessIssue]
-        # When hp_grad_weight=True and fused path was used, act_scales is
-        # None (side outputs elided). Save a 0-element placeholder to keep
-        # backward indexing stable — it's never accessed in that path.
-        act_scales_save = (
-            act_scales if act_scales is not None
-            else torch.empty(0, device=input.device, dtype=torch.int8)
-        )
+        # act_scales is only needed in backward for the grad_weight path when
+        # hp_grad_weight=False (dequant activation before matmul).  When
+        # hp_grad_weight=True the BF16 input is used directly, so save a
+        # 0-element placeholder to keep backward indexing stable and avoid
+        # persisting the (K//bs, M) int8 tensor across the backward pass.
+        if hp_grad_weight or act_scales is None:
+            act_scales_save = torch.empty(0, device=input.device, dtype=torch.int8)
+        else:
+            act_scales_save = act_scales
         if abd:
             # ABD: skip W_lo in backward — don't save it
             saved = [
