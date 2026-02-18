@@ -40,10 +40,10 @@ try:
         block_quantize_fp8,
         fused_act_quant_dual_gemm_forward,
         fused_block_scaled_dual_gemm_backward_dx,
+        fused_block_scaled_dual_gemm_forward,
         fused_dual_gemm_backward_dx,
         fused_dual_gemm_forward,
         fused_dual_quantize_fp8,
-        fused_wtquant_block_scaled_dual_gemm_forward,
         is_triton_available,
     )
 
@@ -597,29 +597,23 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
 
         # --- 3. Act quantize + block-scaled dual GEMM ---
         # Dispatch strategy:
-        #   use_fused_act (small N): quantise W separately, fuse act-quant+GEMM
-        #   else (large N):          quantise act separately, fuse W-quant+GEMM
-        #                            (eliminates W_hi/W_lo intermediate GMEM traffic)
+        #   use_fused_act (small N ≤ 512): fuse act-quant into GEMM kernel
+        #   else (large N > 512):          quantise act separately, then GEMM
         N = weight.shape[0]
         num_n_tiles = (N + 127) // 128  # approx (BLOCK_N varies by autotune)
         use_fused_act = num_n_tiles <= 4
 
-        # Declare w_lo_fp8 / w_lo_scales as possibly-None for the ABD path.
-        w_lo_fp8: torch.Tensor | None
-        w_lo_scales: torch.Tensor | None
+        # Pre-quantise W (shared between both dispatch paths).
+        # error_buf updated in-place — ErrorFeedbackState.get_error returns
+        # a reference to the internal buffer, so no update_error() call needed.
+        w_hi_fp8, w_lo_fp8, w_hi_scales, w_lo_scales = fused_dual_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
+            weight,
+            block_size=scale_block_size,
+            error_buf=error_buf,
+            stochastic_lo=srr,
+        )
 
         if use_fused_act:
-            # Pre-quantise W (separate kernel), then fuse act-quant into GEMM.
-            w_hi_fp8, w_lo_fp8, w_hi_scales, w_lo_scales = fused_dual_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
-                weight,
-                block_size=scale_block_size,
-                error_buf=error_buf,
-                stochastic_lo=srr,
-            )
-            # error_buf updated in-place by fused_dual_quantize_fp8 —
-            # ErrorFeedbackState.get_error returns a reference to the internal
-            # buffer, so no explicit update_error() call is needed.
-
             output_2d, act_fp8, act_scales = fused_act_quant_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
                 input_2d, w_hi_fp8, w_lo_fp8,
                 w_hi_scales, w_lo_scales,
@@ -627,23 +621,15 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
                 save_side_outputs=not hp_grad_weight,
             )
         else:
-            # Quantise act separately, then fuse W-quant into GEMM.
-            # fused_wtquant reads W_bf16 once and quantises W_hi / W_lo
-            # in-register, eliminating the intermediate FP8 GMEM round-trip.
             act_fp8, act_scales = block_quantize_fp8(  # pyright: ignore[reportPossiblyUnboundVariable]
                 input_2d, block_size=scale_block_size,
                 fp8_dtype=torch.float8_e4m3fn,
             )
-            (
-                output_2d, w_hi_fp8, w_lo_fp8, w_hi_scales, w_lo_scales,
-            ) = fused_wtquant_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
-                act_fp8, weight, act_scales,
+            output_2d = fused_block_scaled_dual_gemm_forward(  # pyright: ignore[reportPossiblyUnboundVariable]
+                act_fp8, w_hi_fp8, w_lo_fp8,
+                act_scales, w_hi_scales, w_lo_scales,
                 block_size=scale_block_size,
-                error_buf=error_buf,
-                stochastic_lo=srr,
-                save_w_lo=not abd,
             )
-            # error_buf updated in-place by fused_wtquant (same protocol).
 
         # --- 7. Add bias and reshape ---
         if bias is not None:
@@ -673,10 +659,6 @@ class _TCFP12BlockScaledFunction(torch.autograd.Function):
                 w_hi_fp8, w_hi_scales, act_scales_save,
             ]
         else:
-            # w_lo_fp8 / w_lo_scales are always real tensors here:
-            #  use_fused_act path: fused_dual_quantize_fp8 always returns tensors
-            #  wtquant path: save_w_lo=True (since abd=False) → returns tensors
-            assert w_lo_fp8 is not None and w_lo_scales is not None
             saved = [
                 input_2d if hp_grad_weight else act_fp8,
                 w_hi_fp8, w_lo_fp8,

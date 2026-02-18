@@ -4,8 +4,8 @@
 
 TCFP-12 decomposes each weight matrix into two FP8 components and executes two real
 `torch._scaled_mm` GEMMs per layer — giving ~6 effective mantissa bits from FP8
-hardware. With a Triton-fused dual-GEMM kernel, a full training step runs **4% faster
-than BF16** on an RTX 5070 Ti while converging to identical perplexity.
+hardware. With Triton fused kernels, a full training step runs **19% faster than BF16**
+on an RTX 5070 Ti while converging to identical perplexity.
 
 > Benchmarked on NVIDIA RTX 5070 Ti · PyTorch 2.10 · CUDA 12.8
 
@@ -17,25 +17,25 @@ than BF16** on an RTX 5070 Ti while converging to identical perplexity.
 
 | Configuration | Time (ms) | vs BF16 | Converges? |
 |---------------|-----------|---------|------------|
-| BF16 (baseline) | 14.54 | 1.00× | Yes |
-| **TCFP-12 TC + Triton Fused** | **14.00** | **0.96× (faster)** | **Yes — ppl 1.9** |
-| TCFP-12 TC | 15.25 | 1.05× | Yes — ppl 1.9 |
-| TCFP-12 TC + Delayed Scaling | 15.31 | 1.05× | Yes — ppl 1.9 |
-| TCFP-12 TC + Block-64 | 15.74 | 1.08× | Yes — ppl 1.9 |
-| TCFP-12 TC + Block-128 | 17.95 | 1.23× | Yes — ppl 1.9 |
-| TCFP-12 TC + Block-32 | 18.60 | 1.28× | Yes — ppl 1.9 |
-| TCFP-12 fake-quantize | 18.64 | 1.28× | Yes — ppl 1.9 |
+| BF16 (baseline) | 15.82 | 1.00× | Yes |
+| **TCFP-12 TC** | **13.28** | **1.19× (faster)** | **Yes — ppl 1.9** |
+| TCFP-12 TC + Fused kernel | 13.17 | 1.20× (faster) | Yes — ppl 1.9 |
+| TCFP-12 TC + Delayed Scaling | 13.32 | 1.19× (faster) | Yes — ppl 1.9 |
+| TCFP-12 TC + Block-64 | 17.01 | 0.93× | Yes — ppl 1.9 |
+| TCFP-12 TC + Block-128 | 17.15 | 0.92× | Yes — ppl 1.9 |
+| TCFP-12 TC + Block-32 | 18.11 | 0.87× | Yes — ppl 1.9 |
+| TCFP-12 fake-quantize | 19.88 | 0.80× | Yes — ppl 1.9 |
 | Pure FP8 (any path) | — | — | **No — ppl 55.6** |
 
 ### Raw GEMM Throughput — 4096×4096×4096
 
 | Kernel | Time (ms) | vs BF16 |
 |--------|-----------|---------|
-| BF16 matmul | 1.53 | 1.00× |
-| FP8 `_scaled_mm` | 0.71 | **2.16× faster** |
-| Triton block-scaled (block=64) | 0.88 | **1.74× faster** |
-| Triton fused dual-GEMM | 1.47 | **1.04× faster** |
-| Naive 2× `_scaled_mm` + add | 1.68 | 0.91× |
+| BF16 matmul | 1.62 | 1.00× |
+| FP8 `_scaled_mm` | 0.74 | **2.19× faster** |
+| Triton block-scaled (block=64) | 0.99 | **1.64× faster** |
+| Triton fused dual-GEMM | 1.53 | **1.06× faster** |
+| Naive 2× `_scaled_mm` + add | 1.68 | 0.97× |
 
 ### Quantization Quality — Gaussian N(0,1), 4096×4096
 
@@ -76,6 +76,31 @@ out = (X @ W_hi) + (X @ W_lo)   (2 tensor-core GEMMs)
 
 This gives ~6 effective mantissa bits using only FP8 hardware. Error feedback carries
 the remaining quantization error forward so it is corrected on the next step.
+
+### Forward Pass Data Flow
+
+```
+  Input X (BF16)               W (BF16) + EF buffer (FP32)
+       │                                  │
+       ▼                                  ▼
+  [block_quantize_fp8]    [fused_dual_quantize_fp8]  ← single kernel, one W read
+       │                       │               │
+  X_fp8 (FP8 E4M3)       W_hi (FP8)      W_lo (FP8)   ← ~6 effective mantissa bits
+       │                  + scales_hi     + scales_lo
+       │                       │
+       │                  new EF = W - dequant(W_hi) - dequant(W_lo)
+       │                  (stored FP32, added back next step)
+       │
+       ├──────────────────────────────────────────────────────┐
+       │                                                      │
+       ▼                                                      ▼
+  GEMM₁: X_fp8 @ W_hi                              GEMM₂: X_fp8 @ W_lo
+  (FP8 tensor cores)                               (FP8 tensor cores)
+       │                                                      │
+       └──────────────────────┬───────────────────────────────┘
+                              ▼
+                    output = GEMM₁ + GEMM₂  (FP32, then cast to BF16)
+```
 
 The full training pass runs **5 FP8 GEMMs** per linear layer:
 - Forward: 2 (X@W_hi, X@W_lo)
@@ -146,6 +171,40 @@ convert_to_tcfp(model, mode=TCFPMode.TCFP12,
 
 # Training loop is unchanged
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+```
+
+### Fine-tuning a Pre-trained Llama Model
+
+```python
+from transformers import AutoModelForCausalLM
+import torch
+from tcfp.nn import convert_to_tcfp
+from tcfp.core import TCFPMode
+
+# Load a pre-trained model in BF16
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    torch_dtype=torch.bfloat16,
+    device_map="cuda",
+)
+
+# Convert all nn.Linear layers to TCFP-12.
+# Layers with non-16-divisible dimensions fall back to fake-quantize automatically.
+convert_to_tcfp(
+    model,
+    mode=TCFPMode.TCFP12,
+    use_tensor_cores=True,
+    abd=True,   # drop W_lo from dX backward — lossless, saves ~20% backward GEMMs
+    srr=True,   # stochastic rounding instead of FP32 error buffer (saves ~26 GB at 7B)
+)
+
+# Training loop is unchanged
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for batch in dataloader:
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
 ```
 
 Drop-in layer replacement is also available directly:
@@ -238,7 +297,7 @@ tcfp/
 └── training/        Training utilities: checkpointing, monitoring, phase
                      detection, progressive quantization, layer policies
 
-tests/               381 tests (380 passed, 1 platform-skipped)
+tests/               413 tests (397 passed, 16 skipped on CPU-only)
 benchmarks/          Throughput, VRAM, and convergence benchmarks
 examples/            TinyGPT and MNIST convergence validation scripts
 ```
@@ -251,7 +310,7 @@ examples/            TinyGPT and MNIST convergence validation scripts
 py -m pytest tests/ -v
 ```
 
-Expected output: **380 passed, 16 skipped** (CUDA-only tests skipped on CPU-only machines).
+Expected output: **397 passed, 16 skipped** (CUDA-only tests skipped on CPU-only machines).
 
 ## Running Benchmarks
 
@@ -277,7 +336,7 @@ py -m examples.train_convergence
 | Trains all transformer layers in FP8? | No — some fall back to BF16 | Yes — no fallbacks |
 | Scaling | Delayed (max-over-history) | Fresh or PDDS |
 | Scale storage | FP32 per-tensor / per-block | Int8 exponents (4× smaller) |
-| Speed vs BF16 | Faster (1 GEMM) | 0.96× with fused kernel |
+| Speed vs BF16 | Faster (1 GEMM) | 1.19× faster (TC path) |
 | Maturity | Production | Research prototype |
 
 ---
@@ -286,7 +345,7 @@ py -m examples.train_convergence
 
 **Current capabilities:**
 - Matches BF16 convergence on TinyGPT (PPL ratio 1.002–1.003×)
-- Faster than BF16 end-to-end with Triton fused kernel (0.96× training step)
+- Faster than BF16 end-to-end: TCFP-12 TC runs at 1.19× BF16 speed (13.28ms vs 15.82ms)
 - 22% less weight VRAM than BF16 at any model size
 - SRR eliminates the error feedback buffer entirely (saves 26 GB at 7B scale)
 - ABD saves ~20% of backward GEMMs with no quality loss
@@ -295,7 +354,7 @@ py -m examples.train_convergence
 - **Single-GPU only** — not validated with FSDP, tensor parallelism, or pipeline parallelism
 - **No framework integration** — requires manual `convert_to_tcfp()` call; no HuggingFace or DeepSpeed plug-in
 - **Research scale only** — validated at TinyGPT (4-layer, d=256); not yet tested at 7B+
-- **Per-block path still slower** — block-scaled kernels are 1.08–1.28× slower than BF16; fusing quantization into the GEMM itself is the remaining gap to close
+- **Per-block path still slower** — block-scaled kernels are 7–14% slower than BF16 (Block-64: 17.01ms, Block-32: 18.11ms vs BF16 15.82ms)
 
 ---
 
