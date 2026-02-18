@@ -360,9 +360,9 @@ class ShieldWorldArchiver:
                 rank = max(1, int(min(t.shape) * rank_fraction))
                 try:
                     U, S, Vt = torch.linalg.svd(t, full_matrices=False)
-                    compressed_buffers[f"{key}.U"] = U[:, :rank].half()
-                    compressed_buffers[f"{key}.S"] = S[:rank].half()
-                    compressed_buffers[f"{key}.Vt"] = Vt[:rank, :].half()
+                    compressed_buffers[f"{key}.U"] = U[:, :rank]
+                    compressed_buffers[f"{key}.S"] = S[:rank]
+                    compressed_buffers[f"{key}.Vt"] = Vt[:rank, :]
                 except Exception:
                     # Fall back to uncompressed on SVD failure
                     compressed_buffers[key] = tensor

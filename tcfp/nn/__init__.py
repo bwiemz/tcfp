@@ -12,6 +12,8 @@ on every forward pass, then use FP8 tensor cores for the matmul.
 
 from __future__ import annotations
 
+import contextlib
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -966,7 +968,7 @@ class TCFPLinear(nn.Module):
         self._bf16_fallback = False
 
     @torch.compiler.disable  # type: ignore[attr-defined]
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
         # BF16 fallback — bypass all quantisation
         if self._bf16_fallback:
             return F.linear(x, self.weight, self.bias)
@@ -1367,6 +1369,7 @@ class LayerDiagnostic:
     weight_bytes_fp8: int
     ef_buffer_bytes: int
     fallback_reason: str | None
+    snr_db: float | None = None
 
 
 @dataclass
@@ -1382,7 +1385,60 @@ class DiagnosticReport:
     vram_fp8_bytes: int
     vram_ef_overhead_bytes: int
     estimated_savings_pct: float
+    min_snr_db: float | None = None
+    mean_snr_db: float | None = None
     layer_details: list[LayerDiagnostic] = field(default_factory=list)
+
+
+def _compute_snr_db(weight: torch.Tensor, scale_block_size: int | None) -> float:
+    """Measure TCFP-12 dual-decomposition quantization SNR in dB.
+
+    Simulates the W_hi + W_lo roundtrip:
+      reconstructed = dequant(quant_hi(W)) + dequant(quant_lo(W - dequant(quant_hi(W))))
+      SNR = 10 * log10(signal_power / noise_power)
+
+    Uses block-scaled path when ``scale_block_size`` is set and the weight
+    dimensions are compatible and Triton kernels are available. Falls back
+    to per-tensor ``to_fp8_e4m3`` otherwise.
+
+    Returns:
+        SNR in dB, or ``float('inf')`` if noise is zero.
+    """
+    w = weight.detach().float()
+
+    use_block = (
+        scale_block_size is not None
+        and _HAS_FUSED_KERNELS
+        and w.is_cuda
+        and w.shape[0] % scale_block_size == 0
+        and w.shape[1] % scale_block_size == 0
+    )
+
+    if use_block:
+        assert scale_block_size is not None  # for type narrowing
+        # block_quantize/dequantize_fp8 are guaranteed available when
+        # _HAS_FUSED_KERNELS is True (checked above).
+        w_hi_fp8, s_hi = block_quantize_fp8(w, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
+        w_hi_recon = block_dequantize_fp8(w_hi_fp8, s_hi, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
+        residual = w - w_hi_recon
+        w_lo_fp8, s_lo = block_quantize_fp8(residual, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
+        w_lo_recon = block_dequantize_fp8(w_lo_fp8, s_lo, scale_block_size)  # pyright: ignore[reportPossiblyUnboundVariable]
+    else:
+        w_hi_fp8, s_hi_scalar = to_fp8_e4m3(w)
+        w_hi_recon = w_hi_fp8.float() * s_hi_scalar
+        residual = w - w_hi_recon
+        w_lo_fp8, s_lo_scalar = to_fp8_e4m3(residual)
+        w_lo_recon = w_lo_fp8.float() * s_lo_scalar
+
+    reconstructed = w_hi_recon + w_lo_recon
+    signal_power = w.pow(2).mean()
+    noise_power = (w - reconstructed).pow(2).mean()
+
+    if signal_power < 1e-20:
+        return float("nan")  # zero/near-zero weights — SNR undefined
+    if noise_power < 1e-20:
+        return float("inf")
+    return (10 * torch.log10(signal_power / noise_power)).item()
 
 
 def diagnose(
@@ -1390,6 +1446,7 @@ def diagnose(
     block_size: int = DEFAULT_BLOCK_SIZE,
     scale_block_size: int | None = None,
     skip_patterns: tuple[str, ...] = ("head",),
+    sample_batch: torch.Tensor | None = None,
 ) -> DiagnosticReport:
     """Run preflight diagnostics on a model before TCFP conversion.
 
@@ -1397,11 +1454,17 @@ def diagnose(
     dimension compatibility for tensor-core and block-scaled paths, and
     estimates VRAM savings.
 
+    When ``sample_batch`` is provided, also measures per-layer quantization
+    SNR (signal-to-noise ratio in dB) for the TCFP-12 dual decomposition.
+    Layers with SNR below 30 dB emit a warning.
+
     Args:
         model: Model to diagnose (unconverted ``nn.Module``).
         block_size: Block size for quantisation compatibility check.
         scale_block_size: Block size for per-block scaling compatibility.
         skip_patterns: Layer name patterns to skip (kept in FP32).
+        sample_batch: If provided, triggers SNR measurement per layer.
+            The tensor itself is unused — its presence is a gate.
 
     Returns:
         :class:`DiagnosticReport` with per-layer details and aggregates.
@@ -1464,6 +1527,12 @@ def diagnose(
         ef_bytes = n_params * 4 if tc_ok else 0
         total_ef += ef_bytes
 
+        # Quantization SNR (only when sample_batch gate is provided)
+        layer_snr: float | None = None
+        if sample_batch is not None:
+            with contextlib.suppress(Exception):
+                layer_snr = _compute_snr_db(module.weight, scale_block_size)
+
         layers.append(
             LayerDiagnostic(
                 name=name,
@@ -1475,6 +1544,7 @@ def diagnose(
                 weight_bytes_fp8=fp8_bytes,
                 ef_buffer_bytes=ef_bytes,
                 fallback_reason=reason,
+                snr_db=layer_snr,
             )
         )
 
@@ -1487,6 +1557,32 @@ def diagnose(
         else 0.0
     )
 
+    # Aggregate SNR stats (exclude inf and nan for meaningful aggregation)
+    snr_values = [ld.snr_db for ld in layers if ld.snr_db is not None]
+    min_snr: float | None = None
+    mean_snr: float | None = None
+    if snr_values:
+        finite_snrs = [
+            s for s in snr_values
+            if not math.isinf(s) and not math.isnan(s)
+        ]
+        min_snr = min(finite_snrs) if finite_snrs else float("inf")
+        mean_snr = sum(finite_snrs) / len(finite_snrs) if finite_snrs else float("inf")
+        # Warn on layers with low SNR (nan/inf excluded — only finite values)
+        _SNR_THRESHOLD_DB = 30.0
+        low_snr_layers = [
+            ld.name for ld in layers
+            if ld.snr_db is not None
+            and not math.isnan(ld.snr_db)
+            and ld.snr_db < _SNR_THRESHOLD_DB
+        ]
+        if low_snr_layers:
+            warnings.warn(
+                f"Low quantization SNR (<{_SNR_THRESHOLD_DB} dB) in "
+                f"{len(low_snr_layers)} layer(s): {', '.join(low_snr_layers)}",
+                stacklevel=2,
+            )
+
     return DiagnosticReport(
         total_linear_layers=len(layers),
         tc_eligible_layers=tc_count,
@@ -1497,6 +1593,8 @@ def diagnose(
         vram_fp8_bytes=total_fp8,
         vram_ef_overhead_bytes=total_ef,
         estimated_savings_pct=savings_pct,
+        min_snr_db=min_snr,
+        mean_snr_db=mean_snr,
         layer_details=layers,
     )
 
@@ -1540,7 +1638,7 @@ def export(model: nn.Module) -> nn.Module:
 
         elif isinstance(module, TCFPLayerNorm):
             vanilla = nn.LayerNorm(
-                module.normalized_shape,
+                module.normalized_shape,  # pyright: ignore[reportArgumentType]
                 eps=module.eps,
             )
             vanilla.weight = module.weight  # pyright: ignore[reportAttributeAccessIssue]

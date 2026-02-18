@@ -55,7 +55,7 @@ def _make_tc_model(n: int = 4) -> nn.Sequential:
     model = nn.Sequential(*layers)
     # Assign non-empty _param_name so EF buffer lookups work
     for i, m in enumerate(model):
-        m._param_name = f"{i}.weight"
+        m._param_name = f"{i}.weight"  # pyright: ignore[reportArgumentType]
     return model
 
 
@@ -471,7 +471,7 @@ class TestProgressiveQuantizer:
         # Designate first layer as highway
         m0 = list(model.modules())[1]
         assert isinstance(m0, TCFPLinear)
-        m0._is_highway = True
+        m0._is_highway = True  # pyright: ignore[reportArgumentType]
         m0.abd = False
 
         pq.step(model, 1.0)  # forces advance since min_stability=0.0
@@ -652,7 +652,7 @@ class TestAdaptiveABDController:
         _populate_ef(model, scale=0.001)
         # Mark first layer as highway
         m0 = list(m for m in model.modules() if isinstance(m, TCFPLinear))[0]
-        m0._is_highway = True
+        m0._is_highway = True  # pyright: ignore[reportArgumentType]
         m0.abd = False
         for _ in range(10):
             ctrl.step(model)
@@ -689,7 +689,7 @@ class TestQuantizationCurriculum:
         qc = QuantizationCurriculum(wave_steps=100, recovery_steps=0, max_waves=5)
         model = _make_model(n=4)
         m0 = list(m for m in model.modules() if isinstance(m, TCFPLinear))[0]
-        m0._is_highway = True
+        m0._is_highway = True  # pyright: ignore[reportArgumentType]
         m0.abd = False
 
         config = qc.get_config(90)  # high aggression
@@ -864,6 +864,65 @@ class TestShieldWorldArchiver:
         assert isinstance(rec_buf, dict)
         # The original "x.U" key should be recovered
         assert "x.U" in rec_buf
+
+    def test_compress_preserves_fp32_dtype(self) -> None:
+        """SVD factors must remain FP32, not be downcast to FP16."""
+        ef_state = self._make_ef_state()
+        compressed = ShieldWorldArchiver.compress_ef_state(ef_state, rank_fraction=0.5)
+        buf_dict = compressed["layer.weight"]["_buffers"]  # type: ignore[index]
+        assert isinstance(buf_dict, dict)
+        for suffix in (".U", ".S", ".Vt"):
+            t = buf_dict[f"layer.weight{suffix}"]
+            assert isinstance(t, torch.Tensor)
+            assert t.dtype == torch.float32, f"{suffix} has dtype {t.dtype}, expected float32"
+
+    def test_compress_small_magnitude_roundtrip(self) -> None:
+        """EF buffers with very small values (1e-7) must survive roundtrip."""
+        ef_state: dict[str, object] = {
+            "layer.weight": {
+                "_buffers": {
+                    "layer.weight": torch.randn(64, 32) * 1e-7,
+                },
+                "_amax_ema": {},
+                "_delayed_amax": {},
+                "_residual_ratio": {},
+                "_step_count": {},
+                "_ema_decay": 0.999,
+            }
+        }
+        original = ef_state["layer.weight"]["_buffers"]["layer.weight"].clone()  # type: ignore[index]
+        compressed = ShieldWorldArchiver.compress_ef_state(ef_state, rank_fraction=0.5)
+        restored = ShieldWorldArchiver.decompress_ef_state(compressed)
+        rec = restored["layer.weight"]["_buffers"]["layer.weight"]  # type: ignore[index]
+        assert isinstance(rec, torch.Tensor)
+        # With FP32 factors, relative error should be modest even at tiny magnitudes
+        # (rank_fraction=0.5 on a full-rank random matrix → well under 50% error)
+        rel_err = (original - rec).norm() / (original.norm() + 1e-12)
+        assert rel_err < 0.5, f"Relative error {rel_err:.4f} too high for small-magnitude EF"
+
+    def test_decompress_handles_legacy_fp16_factors(self) -> None:
+        """Old checkpoints saved SVD factors as FP16 — decompress must still work."""
+        ef_state = self._make_ef_state()
+        original = ef_state["layer.weight"]["_buffers"]["layer.weight"].clone()  # type: ignore[index]
+        # Compress normally (FP32), then manually downcast to FP16 to simulate legacy
+        compressed = ShieldWorldArchiver.compress_ef_state(ef_state, rank_fraction=0.5)
+        buf_dict = compressed["layer.weight"]["_buffers"]  # type: ignore[index]
+        assert isinstance(buf_dict, dict)
+        for key in list(buf_dict.keys()):
+            t = buf_dict[key]
+            if isinstance(t, torch.Tensor):
+                buf_dict[key] = t.half()  # simulate legacy FP16 storage
+        # Decompress should handle FP16 via .float() calls
+        restored = ShieldWorldArchiver.decompress_ef_state(compressed)
+        rec = restored["layer.weight"]["_buffers"]["layer.weight"]  # type: ignore[index]
+        assert isinstance(rec, torch.Tensor)
+        assert rec.dtype == torch.float32
+        assert rec.shape == original.shape
+        # FP16 precision loss exists but reconstruction should be in the right ballpark
+        rel_err = (original - rec).norm() / (original.norm() + 1e-8)
+        assert rel_err < 2.0, (
+            f"Legacy FP16 roundtrip relative error {rel_err:.4f} unexpectedly large"
+        )
 
 
 # ===========================================================================

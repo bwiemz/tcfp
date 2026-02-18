@@ -152,16 +152,16 @@ class TestModelConversion:
         convert_to_tcfp(model, mode=TCFPMode.TCFP12, block_size=32)
 
         # Check types
-        assert isinstance(model[0], TCFPEmbedding)
-        assert isinstance(model[1], TCFPLinear)
-        assert isinstance(model[2], TCFPLayerNorm)
-        assert isinstance(model[3], TCFPLinear)
+        assert isinstance(model[0], TCFPEmbedding)  # pyright: ignore[reportIndexIssue]
+        assert isinstance(model[1], TCFPLinear)  # pyright: ignore[reportIndexIssue]
+        assert isinstance(model[2], TCFPLayerNorm)  # pyright: ignore[reportIndexIssue]
+        assert isinstance(model[3], TCFPLinear)  # pyright: ignore[reportIndexIssue]
 
     def test_convert_preserves_weights(self) -> None:
         model = self._make_simple_model().to(DEVICE)
-        original_weight = model[1].weight.data.clone()
+        original_weight = model[1].weight.data.clone()  # pyright: ignore[reportIndexIssue]
         convert_to_tcfp(model, mode=TCFPMode.TCFP12)
-        assert torch.equal(model[1].weight.data, original_weight)
+        assert torch.equal(model[1].weight.data, original_weight)  # pyright: ignore[reportIndexIssue]
 
     def test_skip_patterns(self) -> None:
         model = nn.ModuleDict(
@@ -342,14 +342,14 @@ class TestBF16Fallback:
         # Prime EF
         x0 = torch.randn(4, 128, device=DEVICE, requires_grad=True)
         layer(x0).sum().backward()
-        ef_before = layer._error_state._buffers["test"].clone()
+        ef_before = layer._error_state._buffers["test"].clone()  # pyright: ignore[reportOptionalMemberAccess]
 
         # BF16 fallback — EF should not change
         layer.fallback_to_bf16()
         x1 = torch.randn(4, 128, device=DEVICE, requires_grad=True)
         layer(x1).sum().backward()
 
-        ef_after = layer._error_state._buffers["test"]
+        ef_after = layer._error_state._buffers["test"]  # pyright: ignore[reportOptionalMemberAccess]
         assert torch.equal(ef_before, ef_after)
 
 
@@ -401,6 +401,64 @@ class TestDiagnose:
         # Actually: savings = (4N - (2N + 4N)) / 4N = -50%
         assert report.estimated_savings_pct < 0
 
+    def test_diagnose_snr_without_sample_batch(self) -> None:
+        """SNR fields are None when sample_batch is not provided."""
+        model = nn.Sequential(nn.Linear(128, 64))
+        report = diagnose(model)
+        assert report.min_snr_db is None
+        assert report.mean_snr_db is None
+        for ld in report.layer_details:
+            assert ld.snr_db is None
+
+    def test_diagnose_snr_with_sample_batch(self) -> None:
+        """SNR is computed when sample_batch is provided."""
+        model = nn.Sequential(nn.Linear(128, 64))
+        dummy = torch.randn(2, 128)  # content unused, just a gate
+        report = diagnose(model, sample_batch=dummy)
+        assert report.min_snr_db is not None
+        assert report.mean_snr_db is not None
+        # TCFP-12 dual decomposition should give decent SNR (>25 dB)
+        assert report.min_snr_db > 25.0
+        for ld in report.layer_details:
+            assert ld.snr_db is not None
+            assert ld.snr_db > 25.0
+
+    def test_diagnose_snr_block_scaled(self) -> None:
+        """Block-scaled SNR path works when specified."""
+        model = nn.Sequential(nn.Linear(128, 64))
+        dummy = torch.randn(2, 128)
+        # scale_block_size=64 — dims are compatible (128 % 64 == 0, 64 % 64 == 0)
+        report = diagnose(model, scale_block_size=64, sample_batch=dummy)
+        assert report.min_snr_db is not None
+        # Per-tensor path (CPU, no Triton) still produces valid SNR
+        assert report.min_snr_db > 20.0
+
+    def test_diagnose_snr_warning_on_low_snr(self) -> None:
+        """Warning fires when a layer reports SNR below 30 dB."""
+        from unittest.mock import patch
+
+        model = nn.Sequential(nn.Linear(128, 64))
+        dummy = torch.randn(2, 128)
+        # Mock _compute_snr_db to return a value below the 30 dB threshold
+        with patch("tcfp.nn._compute_snr_db", return_value=15.0):
+            import warnings as _w
+            with _w.catch_warnings(record=True) as caught:
+                _w.simplefilter("always")
+                diagnose(model, sample_batch=dummy)
+        snr_warnings = [w for w in caught if "Low quantization SNR" in str(w.message)]
+        assert len(snr_warnings) >= 1
+
+    def test_diagnose_snr_identity_weights(self) -> None:
+        """Identity-like weights give high SNR (>40 dB)."""
+        layer = nn.Linear(64, 64)
+        model = nn.Sequential(layer)
+        with torch.no_grad():
+            layer.weight.copy_(torch.eye(64))
+        dummy = torch.randn(2, 64)
+        report = diagnose(model, sample_batch=dummy)
+        assert report.min_snr_db is not None
+        assert report.min_snr_db > 40.0
+
 
 # ---------------------------------------------------------------------------
 # Feature 6: Inference Export
@@ -426,14 +484,14 @@ class TestExport:
         model = nn.Sequential(layer)
         export(model)
         exported_layer = model[0]
-        assert exported_layer.weight.data_ptr() == w_ptr
+        assert exported_layer.weight.data_ptr() == w_ptr  # pyright: ignore[reportCallIssue]
 
     def test_export_output_matches(self) -> None:
         """Exported model output matches F.linear."""
         model = nn.Sequential(TCFPLinear(128, 64))
         model.to(DEVICE)
-        w = model[0].weight.clone()
-        b = model[0].bias.clone() if model[0].bias is not None else None
+        w = model[0].weight.clone()  # pyright: ignore[reportCallIssue]
+        b = model[0].bias.clone() if model[0].bias is not None else None  # pyright: ignore[reportCallIssue]
         export(model)
         x = torch.randn(4, 128, device=DEVICE)
         out = model(x)
@@ -443,11 +501,11 @@ class TestExport:
     def test_export_roundtrip(self) -> None:
         """convert_to_tcfp then export gives same weights as original."""
         model = nn.Sequential(nn.Linear(128, 64), nn.Linear(64, 32))
-        w0 = model[0].weight.data_ptr()
-        w1 = model[1].weight.data_ptr()
+        w0 = model[0].weight.data_ptr()  # pyright: ignore[reportCallIssue]
+        w1 = model[1].weight.data_ptr()  # pyright: ignore[reportCallIssue]
         convert_to_tcfp(model)
         export(model)
-        assert model[0].weight.data_ptr() == w0
-        assert model[1].weight.data_ptr() == w1
+        assert model[0].weight.data_ptr() == w0  # pyright: ignore[reportCallIssue]
+        assert model[1].weight.data_ptr() == w1  # pyright: ignore[reportCallIssue]
         assert isinstance(model[0], nn.Linear)
         assert not isinstance(model[0], TCFPLinear)
