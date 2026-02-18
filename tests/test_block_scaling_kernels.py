@@ -318,6 +318,7 @@ class TestFusedBackwardDX:
             (64, 128, 64, 64),
             (128, 256, 128, 128),
             (64, 256, 128, 64),
+            (64, 128, 64, 32),
         ],
     )
     def test_matches_reference(self, M: int, D_out: int, D_in: int, bs: int) -> None:
@@ -379,7 +380,8 @@ class TestFusedBackwardDX:
         grad_deq = block_dequantize_fp8(grad_fp8, grad_s, bs)  # type: ignore
         ref_hi_only = grad_deq @ w_hi_deq
 
-        assert torch.allclose(result, ref_hi_only, atol=1e-5), (
+        # tl.dot uses TF32 on modern GPUs (~1e-2 abs error vs pure FP32 ref).
+        assert torch.allclose(result, ref_hi_only, atol=1e-2), (
             f"Max diff: {(result - ref_hi_only).abs().max().item():.2e}"
         )
 
