@@ -11,6 +11,18 @@ on an RTX 5070 Ti while converging to identical perplexity.
 
 ---
 
+## Motivation
+
+Standard FP8 (E4M3) has only **3 mantissa bits**, which causes catastrophic precision
+loss in transformer training — naive FP8 diverges to PPL 55.6 vs BF16's PPL 1.9.
+TCFP solves this without falling back to BF16 by exploiting a key insight:
+
+> **The quantization residual is small and well-structured.** A second FP8 GEMM on
+> the residual recaptures most of the lost precision — doubling effective mantissa bits
+> to ~6 while keeping all compute on FP8 tensor cores.
+
+---
+
 ## Performance
 
 ### Training Step — MLP 1024→4096→1024, batch 64×128
@@ -66,57 +78,297 @@ on an RTX 5070 Ti while converging to identical perplexity.
 
 ## How It Works
 
-Single-precision FP8 has only 3 mantissa bits — too coarse for transformer gradient
-flow. TCFP-12 solves this by splitting each weight into a main component and a residual:
+### The Core Idea: Residual Weight Decomposition
+
+Standard FP8 (E4M3) has only **3 mantissa bits**, which is too coarse for stable
+transformer training. TCFP-12 doubles the effective precision by decomposing each
+weight matrix into a main component and a quantization residual, then running two
+separate FP8 GEMMs whose results are summed in FP32:
 
 ```
-W  = W_hi + W_lo          (FP8 E4M3 main + FP8 E4M3 residual)
-out = (X @ W_hi) + (X @ W_lo)   (2 tensor-core GEMMs)
+W   = W_hi + W_lo + ε         (decompose into two FP8 E4M3 tensors)
+out = X @ W_hi + X @ W_lo     (two tensor-core GEMMs, accumulated in FP32)
 ```
 
-This gives ~6 effective mantissa bits using only FP8 hardware. Error feedback carries
-the remaining quantization error forward so it is corrected on the next step.
+`W_hi = quant_fp8(W)` captures the bulk of the weight; `W_lo = quant_fp8(W − dequant(W_hi))`
+is the quantization residual. Because `|W_lo| ≪ |W|`, it is well-represented in FP8
+despite the limited range — yielding **~6 effective mantissa bits** with only FP8 hardware.
 
-### Forward Pass Data Flow
+---
+
+### Step 1 — FP8 Quantization
+
+Each component is mapped to FP8 E4M3 with a per-tensor (or per-block) scale:
+
+```
+scale    = FP8_E4M3_MAX / max|W|     # 448 / amax(W)
+W_scaled = W × scale                 # map to [-448, +448]
+W_fp8    = round_to_fp8_e4m3(W_scaled)
+inv      = 1 / scale                 # stored alongside W_fp8 for dequant
+```
+
+In Python (`tcfp/core.py`):
+
+```python
+def to_fp8_e4m3(tensor, scale=None):
+    if scale is None:
+        amax = tensor.abs().max().clamp(min=1e-12)
+        scale = (FP8_E4M3_MAX / amax).to(torch.float32)   # FP8_E4M3_MAX = 448.0
+    scaled = (tensor.float() * scale).clamp(FP8_E4M3_MIN, FP8_E4M3_MAX)
+    fp8    = scaled.to(torch.float8_e4m3fn)
+    inv_scale = torch.ones(1, device=tensor.device, dtype=torch.float32) / scale
+    return fp8, inv_scale
+```
+
+---
+
+### Step 2 — Error Feedback
+
+After quantizing, the total rounding error `ε = W − dequant(W_hi) − dequant(W_lo)` is
+accumulated in a per-parameter FP32 buffer. On the next step it is added back before
+quantization, making the long-run quantization **unbiased**:
+
+```
+# Step t:
+w_eff = W + e_{t-1}                                 # add accumulated error
+W_hi  = quant_fp8(w_eff)                             # main component
+W_lo  = quant_fp8(w_eff − dequant(W_hi))             # residual component
+e_t   = W − (dequant(W_hi) + dequant(W_lo))          # new error → FP32 buffer
+```
+
+In Python (`tcfp/nn/__init__.py` — `_TCFP12TensorCoreFunction.forward`):
+
+```python
+# 1. Add accumulated error from step t-1
+w = weight.float()
+if error_state is not None:
+    w = w + error_state.get_error(param_name, w)      # w_eff = W + e_{t-1}
+
+# 2. Quantize main component
+w_hi_fp8, w_hi_inv = to_fp8_e4m3(w)                  # W_hi in FP8 E4M3
+
+# 3. Compute and quantize residual
+residual   = w - w_hi_fp8.float() * w_hi_inv          # residual = w_eff − dequant(W_hi)
+w_lo_fp8, w_lo_inv = to_fp8_e4m3(residual)            # W_lo in FP8 E4M3
+
+# 4. Store new error for step t+1
+if error_state is not None and update_ef:
+    w_reconstructed = (w_hi_fp8.float() * w_hi_inv
+                       + w_lo_fp8.float() * w_lo_inv)
+    error_state.update_error(param_name, weight.float() - w_reconstructed)
+```
+
+The EF buffer costs **4 bytes × N_weights** of FP32 state. SRR (see below) eliminates
+this buffer entirely.
+
+---
+
+### Step 3 — Forward Pass (2 FP8 GEMMs)
+
+With both weight components ready, the forward pass quantizes the input once and runs
+two FP8 GEMMs accumulated in FP32:
+
+```
+X_fp8 = quant_fp8(X)
+out   = scaled_mm(X_fp8, W_hi, s_x, s_hi)    # GEMM₁ — FP8 tensor cores → FP32
+      + scaled_mm(X_fp8, W_lo, s_x, s_lo)    # GEMM₂ — FP8 tensor cores → FP32
+```
+
+Data flow:
 
 ```
   Input X (BF16)               W (BF16) + EF buffer (FP32)
        │                                  │
        ▼                                  ▼
-  [block_quantize_fp8]    [fused_dual_quantize_fp8]  ← single kernel, one W read
+  [to_fp8_e4m3(X)]     [fused_dual_quantize_fp8]  ← single Triton kernel, one W read
        │                       │               │
-  X_fp8 (FP8 E4M3)       W_hi (FP8)      W_lo (FP8)   ← ~6 effective mantissa bits
-       │                  + scales_hi     + scales_lo
-       │                       │
-       │                  new EF = W - dequant(W_hi) - dequant(W_lo)
-       │                  (stored FP32, added back next step)
+  X_fp8, s_x             W_hi_fp8, s_hi    W_lo_fp8, s_lo
+       │                                         │
+       │             e_t = W − dequant(W_hi) − dequant(W_lo)   (→ EF buffer, FP32)
        │
-       ├──────────────────────────────────────────────────────┐
-       │                                                      │
-       ▼                                                      ▼
-  GEMM₁: X_fp8 @ W_hi                              GEMM₂: X_fp8 @ W_lo
-  (FP8 tensor cores)                               (FP8 tensor cores)
-       │                                                      │
-       └──────────────────────┬───────────────────────────────┘
-                              ▼
-                    output = GEMM₁ + GEMM₂  (FP32, then cast to BF16)
+       ├─────────────────────────────────────────┐
+       ▼                                         ▼
+  GEMM₁: scaled_mm(X_fp8, W_hi, s_x, s_hi)  GEMM₂: scaled_mm(X_fp8, W_lo, s_x, s_lo)
+  (FP8 E4M3 tensor cores → FP32)             (FP8 E4M3 tensor cores → FP32)
+       │                                         │
+       └──────────────────┬──────────────────────┘
+                          ▼
+               output = GEMM₁ + GEMM₂   (FP32 → cast to BF16)
 ```
 
-The full training pass runs **5 FP8 GEMMs** per linear layer:
-- Forward: 2 (X@W_hi, X@W_lo)
-- Backward dX: 1 fused (grad@(W_hi+W_lo) in a single Triton kernel)
-- Backward dW: 2 (high-precision weight gradients)
+In Python (`tcfp/nn/__init__.py`):
+
+```python
+act_fp8, act_inv = to_fp8_e4m3(input_2d)    # quantize input once for both GEMMs
+
+# 3-tier dispatch: cuBLASLt C++ ext > Triton fused > 2× _scaled_mm
+if _HAS_CUDA_EXT and use_cuda_ext:
+    # cuBLASLt: beta=1 accumulation, no intermediate FP32 add buffer
+    output_2d = cuda_ext_dual_gemm_forward(
+        act_fp8, w_hi_fp8, w_lo_fp8, act_inv, w_hi_inv, w_lo_inv)
+
+elif _HAS_FUSED_KERNELS and use_fused_kernel:
+    # Triton: loads activation ONCE, accumulates both GEMMs in registers
+    output_2d = fused_dual_gemm_forward(
+        act_fp8, w_hi_fp8, w_lo_fp8, act_inv, w_hi_inv, w_lo_inv)
+
+else:
+    # Fallback: two independent _scaled_mm calls + Python add
+    out_hi = torch._scaled_mm(act_fp8, w_hi_fp8.t(),
+                               scale_a=act_inv, scale_b=w_hi_inv,
+                               out_dtype=torch.float32)
+    out_lo = torch._scaled_mm(act_fp8, w_lo_fp8.t(),
+                               scale_a=act_inv, scale_b=w_lo_inv,
+                               out_dtype=torch.float32)
+    output_2d = out_hi + out_lo
+```
+
+---
+
+### Step 4 — Backward Pass (3 FP8 GEMMs)
+
+Gradients are cast to FP8 E5M2 (wider dynamic range needed for gradient magnitudes)
+and always quantized fresh — EMA-delayed scales are not used for gradients because
+they change too rapidly during training:
+
+```
+grad_fp8 = quant_fp8_e5m2(∂L/∂out)
+
+# Gradient w.r.t. input X (dual-GEMM, or single with ABD)
+dX = scaled_mm(grad_fp8, W_hi.T, s_g, s_hi)
+   + scaled_mm(grad_fp8, W_lo.T, s_g, s_lo)    # dropped when abd=True
+
+# Gradient w.r.t. weights W (high-precision by default)
+dW = (∂L/∂out).T @ X                           # BF16/FP32 outer product
+```
+
+**Total FP8 GEMMs per layer per training step:**
+
+| Path | Forward | Backward dX | Backward dW | Total |
+|------|---------|-------------|-------------|-------|
+| Standard | 2 | 2 | 1 | **5** |
+| + ABD (`abd=True`) | 2 | 1 | 1 | **4** |
+
+In Python (`tcfp/nn/__init__.py` — `_TCFP12TensorCoreFunction.backward`):
+
+```python
+grad_fp8, grad_inv = to_fp8_e5m2(grad_2d)       # quantize gradient to E5M2
+
+if is_abd:
+    # ABD: single GEMM using W_hi only — W_lo contribution is negligible
+    grad_input = torch._scaled_mm(
+        grad_fp8, ensure_column_major(w_hi_fp8),
+        scale_a=grad_inv, scale_b=w_hi_inv,
+        out_dtype=torch.float32).reshape(input_shape)
+else:
+    # Full: fused Triton kernel loads grad once, computes both GEMMs in registers
+    grad_input = fused_dual_gemm_backward_dx(
+        grad_fp8, w_hi_fp8, w_lo_fp8,
+        grad_inv, w_hi_inv, w_lo_inv).reshape(input_shape)
+
+# dW: high-precision (BF16) for numerically stable optimizer updates
+if hp_grad_weight:
+    grad_weight = grad_2d.t() @ saved_act        # full-precision outer product
+```
+
+---
+
+### Effective Precision
+
+| Format | Mantissa bits | MSE on N(0,1) | SNR (dB) |
+|--------|--------------|---------------|----------|
+| BF16 | 7 | 2.76e-06 | 55.6 |
+| **TCFP-12** | **~6** | **2.48e-05** | **46.0** |
+| FP8 E4M3 | 3 | 7.02e-04 | 31.5 |
+
+TCFP-12 provides 14.5 dB better SNR than naive FP8 while keeping all compute on FP8
+tensor cores.
+
+---
+
+### Optional Enhancements
+
+#### Stochastic Residual Rounding (SRR)
+
+Instead of carrying a FP32 error buffer, SRR replaces the `W_lo` quantization step with
+stochastic rounding. Since stochastic rounding is **unbiased per step** — `E[SR(x)] = x`
+— no accumulation buffer is needed:
+
+```
+p(round_up) = (x − floor_fp8(x)) / ulp(x)     # probability proportional to proximity
+```
+
+In Python (`tcfp/core.py`):
+
+```python
+def stochastic_round_to_fp8_e4m3(tensor):
+    lo   = tensor.to(torch.float8_e4m3fn)       # floor in FP8
+    hi   = find_next_fp8_neighbor(lo, tensor)   # ceil in FP8
+    gap  = (hi.float() - lo.float()).abs().clamp(min=1e-45)
+    frac = ((tensor - lo.float()).abs() / gap).clamp(0.0, 1.0)
+    rand = torch.rand_like(frac)
+    return torch.where(rand < frac, hi, lo)     # probabilistic rounding
+```
+
+This eliminates **4 bytes × N_weights** of FP32 state — **~26 GB at 7B scale** —
+with no convergence loss.
+
+#### Predictive Dual-Track Delayed Scaling (PDDS)
+
+Avoids a full `amax` reduction every step by tracking an EMA of the `W_hi` scale and
+predicting the `W_lo` scale from the historical `amax_lo / amax_hi` ratio:
+
+```
+amax_hi_t = α · amax_hi_{t-1} + (1−α) · amax_hi_current    # α = 0.999
+amax_lo_t ≈ amax_hi_t × ratio_ema                           # zero-cost prediction
+```
+
+In Python (`tcfp/core.py`):
+
+```python
+def get_delayed_amax(self, name, current_amax):
+    # EMA: 0.999 * prev_delayed_amax + 0.001 * current  (~693-step half-life)
+    self._delayed_amax[name] = (
+        self._ema_decay * prev + (1 - self._ema_decay) * current_amax.detach())
+    return self._delayed_amax[name]
+
+def predict_residual_amax(self, name, main_amax):
+    # Use tracked ratio; fall back to 1/8 (FP8 E4M3: 3 mantissa bits → max rounding error ≈ 2^-3)
+    ratio = self._residual_ratio.get(f"{name}.ratio", 1 / 8)
+    return (main_amax * ratio).clamp(min=1e-12)
+```
+
+#### Per-Block Scaling
+
+Each block of 32/64/128 elements gets its own scale stored as an `int8` exponent
+(E8M0 format) — **4× smaller than FP32 scales** — capturing per-region dynamic range:
+
+```
+scale_block = 2^ceil(log2(amax_block / FP8_E4M3_MAX))    # power-of-2, stored as int8
+```
+
+In Python (`tcfp/core.py`):
+
+```python
+def compute_block_scales(tensor, block_size=32, fp8_max=448.0):
+    blocked  = tensor.reshape(*batch_dims, num_blocks, block_size)
+    amax     = blocked.abs().amax(dim=-1).clamp(min=1e-12)
+    raw_exp  = torch.ceil(torch.log2(amax / fp8_max))
+    return torch.exp2(raw_exp)           # power-of-2 scale per block
+```
+
+---
 
 ### Kernel Stack
 
-| Component | What it does |
-|-----------|-------------|
-| `fused_dual_quantize_fp8` | Single Triton kernel: error-feedback add → quantize W_hi → compute residual → quantize W_lo, all in registers, one GMEM read |
-| `fused_dual_gemm_forward` | Triton: load activation once, compute both GEMMs, accumulate in registers |
-| `fused_block_scaled_backward_dx_kernel` | Triton: load gradient once, compute `grad @ (W_hi + W_lo)` with inline scale application |
-| cuBLASLt C++ ext | Forward-only: beta=1 accumulation eliminates intermediate FP32 buffer |
-| Per-block scaling | Int8 exponent (E8M0) scales, 4× smaller than FP32; block sizes 32/64/128 |
-| Residual sparsity | Near-zero W_lo blocks skipped via ~5-cycle warp reduction on int8 sentinel |
+| Component | Role |
+|-----------|------|
+| `fused_dual_quantize_fp8` | Single Triton kernel: EF add → quantize `W_hi` → residual → quantize `W_lo`, one GMEM read |
+| `fused_dual_gemm_forward` | Triton: load activation once, accumulate both GEMMs in registers (~25% less memory bandwidth vs two `_scaled_mm`) |
+| `fused_dual_gemm_backward_dx` | Triton: load gradient once, compute `grad @ (W_hi + W_lo)` with inline scale application |
+| cuBLASLt C++ ext | Forward-only: `beta=1` accumulation eliminates intermediate FP32 add buffer |
+| Per-block scaling | `int8` E8M0 exponent scales; block sizes 32/64/128; 4× smaller than FP32 |
+| Residual sparsity | Near-zero `W_lo` blocks skipped via `int8` sentinel (`−128`) detected in GEMM kernel |
 | Side-output elision | `SAVE_SIDE_OUTPUTS: tl.constexpr` — dead stores compiled away when `hp_grad_weight=True` |
 
 ---
